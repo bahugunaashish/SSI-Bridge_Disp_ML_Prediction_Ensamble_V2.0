@@ -1,0 +1,3 @@
+libglu1-mesa
+libgl1
+

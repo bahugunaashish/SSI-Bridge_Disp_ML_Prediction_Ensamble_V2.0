@@ -1,19 +1,38 @@
-# SSI Bridge Displacement ML Prediction — Ensemble V2.0
+# SSI Bridge Displacement ML Prediction Ensemble V2.0
 
-This repository is the separate V2.0 Streamlit application for the updated SSI displacement predictors. The V1.0 repository remains unchanged.
+Separate Streamlit application based on the V1.0 repository. It retains the V1.0 prediction, comparison, train/validation/test overfitting, case-study/SHAP, and new SSI case features, and adds a displacement-range analysis view for the new 15-model run. The V1.0 repository is not changed.
 
-The V2.0 app is being prepared to carry forward the V1.0 interface and analysis features while supporting 15 predictor choices: the 12 fold-checkpointed predictors and three GPR prediction-level hybrids.
+## Models and archive
 
-## Model and analysis data
+The app loads the cluster `.tar.gz` export from Google Drive at first startup, extracts it to Streamlit's temporary storage, verifies checkpoint SHA-256 hashes, and builds the runtime manifest. The archive must retain the export directory structure and include:
 
-Keep the cluster export in a dedicated child folder of the existing shared Google Drive folder. It should include the 12 models' fold checkpoints, the GPR hybrid blend checkpoints, held-out predictions for all 15 choices, train/validation/test predictions for the 12 checkpointed predictors, range metrics, SHAP outputs, training logs, and metadata. Preserve its directory structure.
+- `checkpoints/fold_1/` through `checkpoints/fold_5/` with the 12 checkpointed predictor files (`.pt` and `gpr.joblib`)
+- `all_folds_all_models_predictions.csv` for train/validation/test plots
+- `shapley/shapley_sample_values.csv` for the SHAP case-study feature
+- `range_aware_ensemble/` with held-out predictions, range metrics, and GPR prediction-level blend checkpoints
 
-Do not commit model checkpoint binaries or simulation databases to this repository.
+The three GPR prediction-level hybrids use the paired neural/GPR checkpoints plus saved blend weights; they do not have independent neural weight files. Train/validation/test outputs are available for the 12 checkpointed predictors, and held-out cross-fitted results are available for all 15 choices.
 
-## Deployment configuration
+## Streamlit Secrets
 
-The app will read the model/data folder ID and existing input database IDs from Streamlit Secrets. Reuse the service account already granted Viewer access to the shared Drive folder.
+Reuse the existing `google_service_account_json` and `[google_drive].file_id` values for the input HDF5 database. Add the archive file ID provided for this V2 run:
 
-## Current status
+```toml
+[google_drive]
+file_id = "<existing input HDF5 file ID>"
+model_archive_file_id_V2 = "<uploaded tar.gz file ID>"
+new_prediction_parent_folder_id = "<existing V1 shared parent folder ID>"
+```
 
-The repository was empty when initialized. App source and model-bundle integration are being added separately; this README does not mean deployment is ready yet.
+`google_service_account_json` must be set as a top-level Streamlit secret. Give that service account Viewer access to the archive and the existing HDF5/source files.
+
+The new-case builder reuses the V1.0 shared Drive parent folder ID. It discovers the immediate child folders named `EQs` and `soil_profiles`; separate child-folder IDs are not required.
+
+## Run locally
+
+```bash
+python -m pip install -r requirements.txt
+streamlit run app.py
+```
+
+Set the same values in `.streamlit/secrets.toml` for local testing. The application reads the archive and input HDF5; it does not retrain models or modify simulation databases.
