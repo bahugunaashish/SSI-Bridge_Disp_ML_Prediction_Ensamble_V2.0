@@ -1162,7 +1162,7 @@ with tab_range:
 
 with tab_overfit:
     st.subheader("Overfitting analysis — training, validation, and held-out test")
-    st.caption("Train/validation/test rows are available for the 12 checkpointed predictors. The three GPR prediction-level hybrids are evaluated on held-out folds only.")
+    st.caption("Training predictions are shown for the 12 checkpointed predictors when the cluster export includes them. The three GPR prediction-level hybrids are evaluated on held-out folds only.")
     st.caption("All metrics and plot values use |U| < 1e-8 mm → 0 mm for both actual and "
                "predicted Ux/Uy. MAPE excludes adjusted zero actual values. "
                "Error SD is sample SD of prediction residuals.")
@@ -1193,6 +1193,11 @@ with tab_overfit:
                 st.success(f"Loaded {len(of):,} predictions from {of.simulation_id.nunique():,} simulations.")
                 breakdown = of.groupby("split", sort=False).size().rename("Predictions").reset_index()
                 st.dataframe(breakdown, hide_index=True)
+                if "train" not in set(of["split"]):
+                    st.warning(
+                        "This archive has no per-simulation training predictions. "
+                        "Use the prediction-only export script on the cluster, then "
+                        "include its train-inclusive CSV in a refreshed archive.")
                 c_models, c_folds = st.columns(2)
                 with c_models:
                     chosen_models = st.multiselect(

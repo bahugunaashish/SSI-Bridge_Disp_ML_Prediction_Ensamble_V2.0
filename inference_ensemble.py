@@ -131,7 +131,10 @@ def _write_plot_tables(data_root: Path) -> None:
                 "predicted_Ux_mm": ux, "predicted_Uy_mm": uy})
     pd.DataFrame(comparison).to_csv(data_root / "comparison_metrics_V2.csv", index=False)
 
-    cv_path = data_root / "all_folds_all_models_predictions.csv"
+    # Prefer the prediction-only recovery output when the archive contains it.
+    cv_with_train_path = data_root / "all_folds_all_models_predictions_with_train.csv"
+    cv_path = (cv_with_train_path if cv_with_train_path.is_file()
+               else data_root / "all_folds_all_models_predictions.csv")
     cv = pd.read_csv(cv_path)
     cv = cv[cv["model"].isin(BASE_MODELS)].copy()
     cv_out = pd.DataFrame({
