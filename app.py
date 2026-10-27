@@ -47,6 +47,36 @@ def display_series_name(series):
     return f"{display_model_name(model)}{separator}{suffix}" if separator else display_model_name(text)
 
 
+def display_model_columns(frame):
+    """Copy a table and abbreviate all user-facing model-name columns."""
+    result = frame.copy()
+    if "model" in result.columns:
+        result["model"] = result["model"].map(display_model_name)
+    if "Model" in result.columns:
+        result["Model"] = result["Model"].map(display_model_name)
+    if "Series" in result.columns:
+        result["Series"] = result["Series"].map(display_series_name)
+    return result
+
+
+def apply_reference_plot_style(fig):
+    """Apply the common four-sided Cartesian style used in the reference plot."""
+    axis = {
+        "showline": True, "mirror": True, "linecolor": "#222222",
+        "linewidth": 1.2, "showgrid": True, "gridcolor": "#C6C6C6",
+        "griddash": "dash", "gridwidth": 1, "ticks": "outside",
+        "ticklen": 5, "tickcolor": "#222222", "zeroline": False,
+        "automargin": True,
+    }
+    fig.update_xaxes(**axis)
+    fig.update_yaxes(**axis)
+    fig.update_layout(
+        plot_bgcolor="white", paper_bgcolor="white",
+        font={"family": "Courier New, Courier, monospace", "color": "#000000"},
+    )
+    return fig
+
+
 st.set_page_config(page_title="SSI Bridge ML Ensemble V2.0", layout="wide")
 st.title("SSI Bridge displacement prediction — Ensemble V2.0")
 st.caption("15 model choices using the new cluster training export. V1.0 remains unchanged.")
@@ -112,7 +142,7 @@ with tab_predict:
     model = None
     fold = None
     if mode != "Compare all models":
-        model = st.selectbox("Model", sorted(models))
+        model = st.selectbox("Model", sorted(models), format_func=display_model_name)
         if mode == "Single fold":
             fold = st.selectbox("Fold", [e["fold"] for e in models[model]])
 
@@ -168,7 +198,7 @@ with tab_predict:
                     for name in names:
                         results[name] = predict_folds(path, cid, root, name, fold=fold if mode == "Single fold" else None)
                 for name, result in results.items():
-                    st.subheader(name.replace("_", " ").upper())
+                    st.subheader(display_model_name(name))
                     ux, uy = result["mean_m"]
                     a, b = st.columns(2)
                     a.metric("Peak |Ux| (mm)", f"{1000*ux:.4f}")
@@ -226,7 +256,8 @@ def metric_values(actual, predicted):
     good = np.isfinite(actual) & np.isfinite(predicted)
     actual, predicted = actual[good], predicted[good]
     if len(actual) == 0:
-        return float("nan"), float("nan"), float("nan"), float("nan"), 0
+        return (float("nan"), float("nan"), float("nan"), float("nan"),
+                0, float("nan"), float("nan"))
     residual = actual - predicted
     rmse = float(np.sqrt(np.mean(residual ** 2)))
     residual_std = float(np.std(residual, ddof=1)) if len(residual) > 1 else float("nan")
@@ -234,7 +265,13 @@ def metric_values(actual, predicted):
     r2 = float(1 - np.sum(residual ** 2) / ss_total) if ss_total > 0 else float("nan")
     nonzero = actual != 0.0  # MAPE is undefined for zero actual values
     mape = float(100 * np.mean(np.abs(residual[nonzero] / actual[nonzero]))) if nonzero.any() else float("nan")
-    return r2, mape, rmse, residual_std, int(nonzero.sum())
+    mae = float(np.mean(np.abs(residual)))
+    denominator = np.abs(actual) + np.abs(predicted)
+    smape_terms = np.zeros_like(residual, dtype=float)
+    comparable = denominator > 0.0
+    smape_terms[comparable] = 200.0 * np.abs(residual[comparable]) / denominator[comparable]
+    smape = float(np.mean(smape_terms))
+    return r2, mape, rmse, residual_std, int(nonzero.sum()), mae, smape
 
 
 def plot_comparison(data: pd.DataFrame, direction: str, title: str, axis_ranges=None, legend_rmse=False, distinguish_splits=False):
@@ -258,9 +295,10 @@ def plot_comparison(data: pd.DataFrame, direction: str, title: str, axis_ranges=
         actual, predicted = actual[valid], predicted[valid]
         if not len(actual):
             continue
-        r2, mape, rmse, residual_std, mape_cases = metric_values(actual, predicted)
+        r2, mape, rmse, residual_std, mape_cases, mae, smape = metric_values(actual, predicted)
         metrics.append({"Series": display_series_name(label), "Cases": len(actual), "MAPE valid cases": mape_cases,
                         "R²": r2, "MAPE (%)": mape, "RMSE (mm)": rmse,
+                        "MAE (mm)": mae, "sMAPE (%)": smape,
                         "Error SD (mm)": residual_std})
         model = str(subset["model"].iloc[0])
         fold_label = str(subset["fold"].iloc[0]) if " / fold_" in label else "mean"
@@ -274,7 +312,9 @@ def plot_comparison(data: pd.DataFrame, direction: str, title: str, axis_ranges=
             marker_symbol = split_symbols.get(split, marker_symbol)
         color = model_colors.get(model, "#555555")
         # Keep existing legends untouched; optionally show RMSE for overfitting plots.
-        legend_label = f"{label} | RMSE={rmse:.3f} mm" if legend_rmse else label
+        display_label = display_series_name(label)
+        legend_label = (f"{display_label} | RMSE={rmse:.3f} mm"
+                        if legend_rmse else display_label)
         fig.add_trace(go.Scattergl(
             x=actual, y=predicted, mode="markers", name=legend_label,
             customdata=subset.loc[valid, ["simulation_id"]].to_numpy(),
@@ -335,7 +375,7 @@ def plot_comparison(data: pd.DataFrame, direction: str, title: str, axis_ranges=
         fig.update_yaxes(**axis_style, scaleanchor=False)
         fig.update_xaxes(range=list(axis_ranges[0]), autorange=False)
         fig.update_yaxes(range=list(axis_ranges[1]), autorange=False)
-    return fig, pd.DataFrame(metrics)
+    return apply_reference_plot_style(fig), pd.DataFrame(metrics)
 
 
 def comparison_axis_controls(direction: str):
@@ -444,7 +484,7 @@ with tab_compare:
     st.caption("Held-out predictions from the new cluster run; changing selections does not retrain or rerun inference.")
     st.caption("Error SD (mm) is the sample standard deviation of actual minus predicted displacement errors (n − 1 denominator).")
     st.caption("For plots and all metrics, values with |displacement| < 0.001 mm are set to 0. "
-               "MAPE excludes cases where actual displacement is zero; 'MAPE valid cases' shows its denominator. "
+               "MAPE excludes actual values below 0.001 mm; 'MAPE valid cases' shows its denominator. "
                "The downloadable CSV retains original, unmodified values.")
     st.warning("These are held-out, out-of-fold predictions. The three GPR hybrids are cross-fitted from other folds; inspect the range metrics for performance across displacement decades.")
     try:
@@ -459,7 +499,9 @@ with tab_compare:
                 st.session_state["comparison_loaded"] = True
                 st.caption(f"Loaded {len(df):,} model-fold predictions across {df.simulation_id.nunique():,} simulations.")
                 model_options = sorted(df["model"].unique().tolist())
-                selected_models = st.multiselect("Models", model_options, default=model_options)
+                selected_models = st.multiselect(
+                    "Models", model_options, default=model_options,
+                    format_func=display_model_name)
                 fold_options = sorted(df["fold"].unique().tolist())
                 selected_folds = st.multiselect("Folds (select any combination)", fold_options, default=fold_options)
                 display_mode = st.radio("Fold display", ["Mean of selected folds", "Each selected fold", "Both"], horizontal=True)
@@ -552,10 +594,23 @@ def overfit_metrics_table(data, direction, group_columns):
             group_key = (group_key,)
         a = group[f"actual_{direction}_mm"].to_numpy(dtype=float)
         p = group[f"predicted_{direction}_mm"].to_numpy(dtype=float)
-        r2, mape, rmse, sd, n_mape = metric_values(a, p)
+        r2, mape, rmse, sd, n_mape, mae, smape = metric_values(a, p)
         row = dict(zip(group_columns, group_key))
+        if "fold" not in group_columns and "fold" in group.columns:
+            fold_mapes = []
+            for _, fold_group in group.groupby("fold", sort=True):
+                fold_mape = metric_values(
+                    fold_group[f"actual_{direction}_mm"].to_numpy(dtype=float),
+                    fold_group[f"predicted_{direction}_mm"].to_numpy(dtype=float))[1]
+                if np.isfinite(fold_mape):
+                    fold_mapes.append(float(fold_mape))
+            if fold_mapes:
+                mape = float(np.median(fold_mapes))
+                row["MAPE mean across folds (%)"] = float(np.mean(fold_mapes))
+                row["MAPE folds used"] = len(fold_mapes)
         row.update({"N": len(group), "MAPE valid cases": n_mape,
                     "R²": r2, "MAPE (%)": mape, "RMSE (mm)": rmse,
+                    "MAE (mm)": mae, "sMAPE (%)": smape,
                     "Error SD (mm)": sd})
         rows.append(row)
     return pd.DataFrame(rows)
@@ -628,13 +683,15 @@ def overfit_ape_fold_histograms(errors, model, direction, folds,
         figure.update_xaxes(
             title_text="APE (%)", range=[0.0, end + step],
             ticks="outside", ticklen=5, tickcolor="#000000",
-            showline=True, linecolor="#000000", row=row, col=col)
+            showline=True, mirror=True, linewidth=1.2,
+            linecolor="#000000", row=row, col=col)
         figure.update_yaxes(
             title_text=("Percent of cases" if normalized else "Simulations")
                        if col == 1 else "",
             showticklabels=(col == 1),
             ticks="outside", ticklen=5, tickcolor="#000000",
-            showline=True, linecolor="#000000", rangemode="tozero",
+            showline=True, mirror=True, linewidth=1.2,
+            linecolor="#000000", rangemode="tozero",
             row=row, col=col)
         key = [f"<b>Fold {str(fold).replace('fold_', '')}</b>"]
         for split in visible:
@@ -677,7 +734,7 @@ def overfit_ape_fold_histograms(errors, model, direction, folds,
         margin={"l": 100, "r": 45, "t": 100, "b": 75},
         showlegend=False,
     )
-    return figure
+    return apply_reference_plot_style(figure)
 
 
 def overfit_gain_data(data, direction, models, folds, splits, baseline):
@@ -818,14 +875,17 @@ def overfit_gain_plot(frame, direction, models, splits, baseline):
         fig.update_xaxes(title_text=label, row=row, col=col)
         fig.update_yaxes(
             tickmode="array", tickvals=list(range(len(models))),
-            ticktext=models, showticklabels=col == 1,
+            ticktext=[display_model_name(model) for model in models],
+            showticklabels=col == 1,
             range=[len(models) - 0.6, -0.6], row=row, col=col)
     font = {"family": "Courier New, Courier, monospace",
             "size": 13, "color": "#000000"}
     fig.update_xaxes(showgrid=True, gridcolor="#D0D0D0",
+                     mirror=True, showline=True, linecolor="#000000", linewidth=1.2,
                      ticks="outside", tickfont=font,
                      title_font={**font, "size": 16})
     fig.update_yaxes(showgrid=True, gridcolor="#D0D0D0",
+                     mirror=True, showline=True, linecolor="#000000", linewidth=1.2,
                      ticks="outside", tickfont=font)
     fig.update_layout(
         template="plotly_white", width=1150, height=790,
@@ -836,15 +896,15 @@ def overfit_gain_plot(frame, direction, models, splits, baseline):
         legend={"orientation": "h", "x": 0.5, "xanchor": "center",
                 "y": 1.06, "font": font},
         margin={"l": 135, "r": 45, "t": 110, "b": 80})
-    return fig
+    return apply_reference_plot_style(fig)
 
 
 def overfit_four_metric_fold_summary(data, direction):
     """Fold-wise metric summaries for the four-panel model comparison.
 
     RMSE, R2, and residual SD: arithmetic mean +/- sample SD across folds.
-    MAPE: lognormal median and asymmetric one-log-SD interval of fold MAPEs.
-    Both use the existing 0.001 mm displacement threshold via metric_values.
+    MAPE: median across fold MAPEs, with the arithmetic mean also retained.
+    Both use the 0.001 mm displacement threshold via metric_values.
     """
     fold_metrics = overfit_metrics_table(
         data, direction, ["model", "fold", "split"])
@@ -861,25 +921,11 @@ def overfit_four_metric_fold_summary(data, direction):
             used = values
             method = "Arithmetic mean +/- sample SD"
             if metric == "MAPE (%)":
-                positive = values[values > 0]
-                if len(positive) >= 2:
-                    log_values = np.log(positive)
-                    log_mean = float(log_values.mean())
-                    log_sd = float(np.std(log_values, ddof=1))
-                    center = float(np.exp(log_mean))
-                    low = float(np.exp(log_mean - log_sd))
-                    high = float(np.exp(log_mean + log_sd))
-                    used = positive
-                    method = "Lognormal median and 68% interval (one log-SD)"
-                    if len(positive) < len(values):
-                        method += "; zero-MAPE folds excluded from lognormal fit"
-                elif len(positive) == 1:
-                    center = low = high = float(positive[0])
-                    used = positive
-                    method = "One positive fold: lognormal spread unavailable"
-                else:
-                    center = low = high = 0.0
-                    method = "All fold MAPEs are zero: no lognormal fit"
+                center = float(np.median(values))
+                low = float(np.min(values))
+                high = float(np.max(values))
+                method = (f"Median of fold MAPEs; arithmetic mean = "
+                          f"{float(np.mean(values)):.4g}%")
             else:
                 center = float(values.mean())
                 spread = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
@@ -972,7 +1018,7 @@ def overfit_four_metric_comparison(summary, direction, selected_models,
     axis_style = {
         "showgrid": True, "gridcolor": "#C6C6C6",
         "griddash": "dot", "gridwidth": 1,
-        "showline": True, "linecolor": "#333333",
+        "showline": True, "mirror": True, "linecolor": "#333333",
         "linewidth": 1.0, "ticks": "outside",
         "ticklen": 5, "tickcolor": "#000000", "zeroline": False,
         "tickfont": {"family": "Courier New, Courier, monospace",
@@ -1000,7 +1046,7 @@ def overfit_four_metric_comparison(summary, direction, selected_models,
         margin={"l": 145, "r": 45, "t": 80, "b": 75},
         hovermode="closest",
     )
-    return fig
+    return apply_reference_plot_style(fig)
 
 
 def overfit_fold_subplots(data, direction, fold_order, axis_ranges=None):
@@ -1144,7 +1190,7 @@ def overfit_fold_subplots(data, direction, fold_order, axis_ranges=None):
             font={"family": "Courier New, Courier, monospace",
                   "size": 17, "color": "#000000"},
         )
-    return fig
+    return apply_reference_plot_style(fig)
 
 
 def overfit_plot_data(data, fold_detail):
@@ -1168,7 +1214,9 @@ with tab_range:
         mcol, ocol = st.columns(2)
         with mcol:
             names = sorted(range_metrics["model"].dropna().astype(str).unique())
-            chosen = st.multiselect("Models / ensemble", names, default=names, key="v2_range_models")
+            chosen = st.multiselect(
+                "Models / ensemble", names, default=names,
+                format_func=display_model_name, key="v2_range_models")
         with ocol:
             outputs = sorted(range_metrics["output"].dropna().astype(str).unique())
             chosen_outputs = st.multiselect("Outputs", outputs, default=outputs, key="v2_range_outputs")
@@ -1182,7 +1230,7 @@ with tab_range:
             selected_metrics = range_metrics[range_metrics["model"].isin(chosen)
                 & range_metrics["output"].isin(chosen_outputs)
                 & range_metrics["range"].astype(str).isin(chosen_ranges)]
-            st.dataframe(selected_metrics, hide_index=True, use_container_width=True)
+            st.dataframe(display_model_columns(selected_metrics), hide_index=True, use_container_width=True)
             for output in chosen_outputs:
                 subset = selected_metrics[selected_metrics["output"] == output]
                 fig = go.Figure()
@@ -1193,6 +1241,12 @@ with tab_range:
                 fig.update_layout(title=f"{output}: {metric_name} by actual displacement range",
                     xaxis_title="Actual displacement range (m)", yaxis_title=metric_name,
                     template="plotly_white", height=600, xaxis={"tickangle": -35})
+                fig.update_xaxes(showline=True, mirror=True, linecolor="#222222",
+                                 linewidth=1.2, ticks="outside", gridcolor="#D0D0D0",
+                                 griddash="dot")
+                fig.update_yaxes(showline=True, mirror=True, linecolor="#222222",
+                                 linewidth=1.2, ticks="outside", gridcolor="#D0D0D0",
+                                 griddash="dot")
                 st.plotly_chart(fig, use_container_width=True, key=f"v2_range_plot_{output}")
             st.download_button("Download selected range metrics CSV",
                 selected_metrics.to_csv(index=False).encode("utf-8"),
@@ -1241,6 +1295,7 @@ with tab_overfit:
                     chosen_models = st.multiselect(
                         "Models — overfitting tab",
                         sorted(of["model"].unique()), default=sorted(of["model"].unique()),
+                        format_func=display_model_name,
                         key="overfit_models")
                 with c_folds:
                     chosen_folds = st.multiselect(
@@ -1338,7 +1393,7 @@ with tab_overfit:
                                     hist_data = ape_errors.loc[
                                         ape_errors["model"].eq(hist_model)]
                                     with st.expander(
-                                            f"{hist_model} — |{direction}| — fold histograms",
+                                    f"{display_model_name(hist_model)} — |{direction}| — fold histograms",
                                             expanded=False):
                                         if hist_data.empty:
                                             st.info("No valid APE values for this model.")
@@ -1362,7 +1417,7 @@ with tab_overfit:
                                     max_ape_pct=("APE (%)", "max"),
                                 )
                                 st.markdown("**Histogram statistics — threshold-adjusted MAPE (%)**")
-                                st.dataframe(summary, hide_index=True,
+                                st.dataframe(display_model_columns(summary), hide_index=True,
                                              use_container_width=True)
                                 st.download_button(
                                     f"Download every {direction} simulation APE (CSV)",
@@ -1376,13 +1431,10 @@ with tab_overfit:
                                 "MAPE and Error SD. Every point summarizes the "
                                 "selected folds for one model/dataset. For RMSE, "
                                 "R² and Error SD, bars show mean ± sample SD. "
-                                "MAPE alone uses a fitted lognormal distribution "
-                                "of positive fold-level MAPE values: the marker "
-                                "is its median, and asymmetric bars span one "
-                                "log-standard deviation above/below the median "
-                                "(approximately the central 68% of the fit). "
-                                "Zero fold-level MAPEs cannot be log-transformed "
-                                "and are reported in the downloadable statistics.")
+                                "MAPE uses the median of the fold-level MAPEs; "
+                                "the arithmetic mean and valid-case counts are "
+                                "reported in the tables. MAE and sMAPE include "
+                                "zero-displacement cases and are also reported.")
                             four_summary = overfit_four_metric_fold_summary(
                                 selected, direction)
                             if four_summary.empty:
@@ -1402,7 +1454,7 @@ with tab_overfit:
                                     key=f"overfit_four_metrics_export_{direction}")
                             st.markdown("### Performance gain relative to a baseline")
                             baseline_choices = ["Training-mean predictor"] + [
-                                f"Model: {m}" for m in sorted(of["model"].unique())
+                                f"Model: {display_model_name(m)}" for m in sorted(of["model"].unique())
                             ]
                             gain_baseline = st.selectbox(
                                 "Baseline for gain analysis", baseline_choices,
@@ -1436,11 +1488,11 @@ with tab_overfit:
                             st.markdown("**Metrics per model, fold, and dataset**")
                             per_fold = overfit_metrics_table(
                                 selected, direction, ["model", "fold", "split"])
-                            st.dataframe(per_fold, hide_index=True)
+                            st.dataframe(display_model_columns(per_fold), hide_index=True)
                             st.markdown("**Pooled selected-fold metrics by model and dataset**")
                             pooled = overfit_metrics_table(
                                 selected, direction, ["model", "split"])
-                            st.dataframe(pooled, hide_index=True)
+                            st.dataframe(display_model_columns(pooled), hide_index=True)
                             if not pooled.empty:
                                 radar_input = pooled.copy()
                                 radar_input["Series"] = (radar_input["model"] +
@@ -1470,7 +1522,7 @@ with tab_overfit:
                                     st.markdown("**Overfitting gap: held-out test versus training**")
                                     st.caption("Positive gap: R² decreased, or RMSE/Error SD "
                                                "increased on test relative to training.")
-                                    st.dataframe(gap.reset_index(), hide_index=True)
+                                st.dataframe(display_model_columns(gap.reset_index()), hide_index=True)
                             st.download_button(
                                 f"Download {direction} per-fold metrics CSV",
                                 per_fold.to_csv(index=False).encode("utf-8"),
@@ -1596,7 +1648,7 @@ def case_plot_style(fig, x_title, y_title, title, axis_ranges=None):
     if axis_ranges is not None:
         fig.update_xaxes(range=list(axis_ranges[0]), autorange=False)
         fig.update_yaxes(range=list(axis_ranges[1]), autorange=False)
-    return fig
+    return apply_reference_plot_style(fig)
 
 
 def add_shap_percentages(data):
@@ -1719,6 +1771,7 @@ with tab_case_study:
                 fold_options = sorted(data["fold"].unique())
                 chosen_models = left.multiselect(
                     "Models", model_options, default=model_options,
+                    format_func=display_model_name,
                     key="shap_compare_models")
                 chosen_folds = right.multiselect(
                     "Folds", fold_options, default=fold_options,
@@ -1754,7 +1807,7 @@ with tab_case_study:
                         for col in ("actual_Ux_mm", "predicted_Ux_mm",
                                     "actual_Uy_mm", "predicted_Uy_mm"):
                             overview[col] = zero_small_displacements(overview[col])
-                        st.dataframe(overview, hide_index=True)
+                        st.dataframe(display_model_columns(overview), hide_index=True)
                         ux_tab, uy_tab = st.tabs(["Case study Ux", "Case study Uy"])
                         for direction, panel in (("Ux", ux_tab), ("Uy", uy_tab)):
                             with panel:
@@ -2133,7 +2186,7 @@ with tab_new_prediction:
                             "Ux (mm)": 1000 * avg_ux, "Uy (mm)": 1000 * avg_uy,
                             "Fold SD Ux (mm)": np.nan, "Fold SD Uy (mm)": np.nan,
                         })
-                        st.dataframe(pd.DataFrame(preview), hide_index=True,
+                        st.dataframe(display_model_columns(pd.DataFrame(preview)), hide_index=True,
                                      use_container_width=True)
                         st.caption("Each selected predictor type is shown with its own held-out estimate. "
                                    "For a five-fold ensemble, each model is averaged over its "
@@ -2290,7 +2343,7 @@ with tab_new_prediction:
                     progress_detail.success(
                         f"Parametric study finished: {successes}/{len(sweep_values)} "
                         "cases predicted and added to the cumulative plot.")
-                    st.dataframe(pd.DataFrame(sweep_summary),
+                    st.dataframe(display_model_columns(pd.DataFrame(sweep_summary)),
                                  hide_index=True, use_container_width=True)
                     if successes < len(sweep_values):
                         st.warning(
@@ -2334,7 +2387,7 @@ with tab_new_prediction:
         "points are not replaced.")
     history_table = new_prediction_history_rows(history)
     if not history_table.empty:
-        st.dataframe(history_table, hide_index=True, use_container_width=True)
+        st.dataframe(display_model_columns(history_table), hide_index=True, use_container_width=True)
         feature_choices = [
             key for key in NEW_PREDICTION_FEATURES
             if key in history_table.columns
@@ -2350,6 +2403,7 @@ with tab_new_prediction:
             model_options = sorted(history_table["Model"].unique())
             chosen_models = st.multiselect(
                 "Models to plot", model_options, default=model_options,
+                format_func=display_model_name,
                 key="new_case_trend_models")
         with foldcol:
             fold_options = sorted(history_table["Fold"].unique())
