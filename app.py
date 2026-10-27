@@ -1,6 +1,8 @@
 """SSI saved-checkpoint inference with Google Drive HDF5 and upload alternatives."""
 import json
 import io
+import re
+from copy import deepcopy
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -40,23 +42,111 @@ def display_model_name(name):
     return MODEL_DISPLAY_NAMES.get(str(name), str(name))
 
 
+_MODEL_LABEL_ALIASES = {
+    **MODEL_DISPLAY_NAMES,
+    "MeshGraphNet": "MG",
+    "Graph Transformer": "GT",
+    "Graph Operator": "GO",
+    "Gaussian Process Regression (GPR)": "GPR",
+    "Gaussian Process Regression": "GPR",
+}
+_MODEL_LABEL_LOOKUP = {name.casefold(): label
+                       for name, label in _MODEL_LABEL_ALIASES.items()}
+_MODEL_LABEL_PATTERN = re.compile(
+    r"(?<![\w])(?:" + "|".join(
+        re.escape(name) for name in sorted(_MODEL_LABEL_ALIASES, key=len, reverse=True)
+    ) + r")(?![\w])", re.IGNORECASE)
+
+
+def display_model_text(value):
+    """Abbreviate model tokens in captions, series, baseline labels and hover text."""
+    if not isinstance(value, str):
+        return value
+    return _MODEL_LABEL_PATTERN.sub(
+        lambda match: _MODEL_LABEL_LOOKUP[match.group().casefold()], value)
+
+
 def display_series_name(series):
-    """Abbreviate the model portion of labels such as model / fold_1."""
-    text = str(series)
-    model, separator, suffix = text.partition(" / ")
-    return f"{display_model_name(model)}{separator}{suffix}" if separator else display_model_name(text)
+    """Format composite model / fold / dataset labels for display."""
+    return display_model_text(str(series))
 
 
 def display_model_columns(frame):
     """Copy a table and abbreviate all user-facing model-name columns."""
-    result = frame.copy()
-    if "model" in result.columns:
-        result["model"] = result["model"].map(display_model_name)
-    if "Model" in result.columns:
-        result["Model"] = result["Model"].map(display_model_name)
-    if "Series" in result.columns:
-        result["Series"] = result["Series"].map(display_series_name)
+    result = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+    for column in result.columns:
+        if (pd.api.types.is_object_dtype(result[column].dtype)
+                or pd.api.types.is_string_dtype(result[column].dtype)
+                or isinstance(result[column].dtype, pd.CategoricalDtype)):
+            result[column] = result[column].map(display_model_text)
+    result = result.rename(index=display_model_text, columns=display_model_text)
     return result
+
+
+def render_model_table(frame, **kwargs):
+    """Display abbreviations without changing the source data or filtering keys."""
+    return st.dataframe(display_model_columns(frame), **kwargs)
+
+
+def render_model_static_table(frame, **kwargs):
+    return st.table(display_model_columns(frame), **kwargs)
+
+
+def model_table_csv(frame):
+    """Download the same model labels and numerical values displayed in tables."""
+    return display_model_columns(frame).to_csv(index=False).encode("utf-8")
+
+
+def _display_text_values(value):
+    if isinstance(value, str):
+        return display_model_text(value)
+    if isinstance(value, (list, tuple)):
+        return [_display_text_values(item) for item in value]
+    if isinstance(value, np.ndarray) and value.dtype.kind in "OUS":
+        return np.array([_display_text_values(item) for item in value], dtype=object)
+    return value
+
+
+def abbreviate_plot_spec(figure_spec):
+    """Format a copy of chart labels, preserving numeric data and plot styling."""
+    spec = deepcopy(figure_spec)
+    for trace in spec.get("data", []):
+        for field in ("name", "text", "hovertext", "hovertemplate", "customdata"):
+            if field in trace and trace[field] is not None:
+                trace[field] = _display_text_values(trace[field])
+        if trace.get("legendgrouptitle", {}).get("text"):
+            trace["legendgrouptitle"]["text"] = display_model_text(
+                trace["legendgrouptitle"]["text"])
+    layout = spec.get("layout", {})
+    title = layout.get("title")
+    if isinstance(title, dict) and title.get("text"):
+        title["text"] = display_model_text(title["text"])
+    elif isinstance(title, str):
+        layout["title"] = display_model_text(title)
+    for annotation in layout.get("annotations", []):
+        if "text" in annotation:
+            annotation["text"] = display_model_text(annotation["text"])
+    for key, value in layout.items():
+        if re.fullmatch(r"[xy]axis\d*", key):
+            if "ticktext" in value:
+                value["ticktext"] = _display_text_values(value["ticktext"])
+            title = value.get("title")
+            if isinstance(title, dict) and title.get("text"):
+                title["text"] = display_model_text(title["text"])
+        elif re.fullmatch(r"legend\d*", key):
+            title = value.get("title")
+            if isinstance(title, dict) and title.get("text"):
+                title["text"] = display_model_text(title["text"])
+    return spec
+
+
+def abbreviate_plot_labels(figure):
+    return go.Figure(abbreviate_plot_spec(figure.to_plotly_json()))
+
+
+def render_model_plot(figure, **kwargs):
+    """All tabs pass charts through this final label-formatting step."""
+    return st.plotly_chart(abbreviate_plot_labels(figure), **kwargs)
 
 
 def apply_reference_plot_style(fig):
@@ -73,6 +163,14 @@ def apply_reference_plot_style(fig):
     fig.update_layout(
         plot_bgcolor="white", paper_bgcolor="white",
         font={"family": "Courier New, Courier, monospace", "color": "#000000"},
+        legend={
+            "orientation": "v", "x": 0.02, "y": 0.98,
+            "xanchor": "left", "yanchor": "top",
+            "bgcolor": "rgba(255,255,255,0.92)",
+            "bordercolor": "#222222", "borderwidth": 1,
+            "font": {"family": "Courier New, Courier, monospace",
+                     "size": 13, "color": "#000000"},
+        },
     )
     return fig
 
@@ -204,7 +302,7 @@ with tab_predict:
                     a.metric("Peak |Ux| (mm)", f"{1000*ux:.4f}")
                     b.metric("Peak |Uy| (mm)", f"{1000*uy:.4f}")
                     st.write("Across-fold SD (mm):", [round(x*1000, 6) for x in result["fold_std_m"]])
-                    st.dataframe([{"fold": f, "Ux (mm)": 1000*v[0], "Uy (mm)": 1000*v[1]} for f, v in zip(result["folds"], result["predictions_m"])], hide_index=True)
+                    render_model_table([{"fold": f, "Ux (mm)": 1000*v[0], "Uy (mm)": 1000*v[1]} for f, v in zip(result["folds"], result["predictions_m"])], hide_index=True)
                 st.download_button("Download results JSON", json.dumps({"case_id": cid, "results": results}, indent=2), file_name=f"{cid}_predictions.json", mime="application/json")
         except Exception as exc:
             st.error(f"Prediction failed: {type(exc).__name__}: {exc}")
@@ -296,7 +394,7 @@ def plot_comparison(data: pd.DataFrame, direction: str, title: str, axis_ranges=
         if not len(actual):
             continue
         r2, mape, rmse, residual_std, mape_cases, mae, smape = metric_values(actual, predicted)
-        metrics.append({"Series": display_series_name(label), "Cases": len(actual), "MAPE valid cases": mape_cases,
+        metrics.append({"Series": label, "Cases": len(actual), "MAPE valid cases": mape_cases,
                         "R²": r2, "MAPE (%)": mape, "RMSE (mm)": rmse,
                         "MAE (mm)": mae, "sMAPE (%)": smape,
                         "Error SD (mm)": residual_std})
@@ -451,7 +549,7 @@ def plot_metrics_radar(metrics: pd.DataFrame, direction: str, distinguish_splits
             r=radial,
             theta=labels + [labels[0]],
             mode="lines+markers",
-        name=display_series_name(row["Series"]),
+            name=display_series_name(row["Series"]),
             line={"color": colors.get(model, "#555555"), "width": 2.2, "dash": style},
             marker={"symbol": symbols.get(model, "circle-open"), "size": 8,
                     "color": series_color},
@@ -469,9 +567,13 @@ def plot_metrics_radar(metrics: pd.DataFrame, direction: str, distinguish_splits
                               "angle": 45, "tickfont": {"size": 12, "color": "#000000"}},
                "angularaxis": {"gridcolor": "#D0D0D0",
                                "tickfont": {"size": 14, "color": "#000000"}}},
-        legend={"x": 1.03, "y": 1, "xanchor": "left", "yanchor": "top",
+        legend={"orientation": "v", "x": 0.02, "y": 0.98,
+                "xanchor": "left", "yanchor": "top",
+                "bgcolor": "rgba(255,255,255,0.92)",
+                "bordercolor": "#222222", "borderwidth": 1,
                 "title": {"text": "Model / dataset" if distinguish_splits else "Model / fold"},
-                "font": {"size": 12, "color": "#000000"}},
+                "font": {"family": "Courier New, Courier, monospace",
+                         "size": 13, "color": "#000000"}},
         margin={"l": 65, "r": 255, "t": 90, "b": 65},
         height=680,
         paper_bgcolor="white",
@@ -529,28 +631,28 @@ with tab_compare:
                         x_ranges = comparison_axis_controls("Ux")
                         fig_x, metrics_x = plot_comparison(
                             chart_df, "Ux", "Peak |Ux|: actual vs. predicted", axis_ranges=x_ranges)
-                        st.plotly_chart(fig_x, use_container_width=True)
-                        st.dataframe(metrics_x, hide_index=True)
+                        render_model_plot(fig_x, use_container_width=True)
+                        render_model_table(metrics_x, hide_index=True)
                         st.subheader("Model performance spider plot — Ux")
                         st.caption("Relative scores (0–1) within the displayed model/fold selection; "
                                    "higher is better on every spoke. R² is maximized; MAPE, RMSE, "
                                    "and error SD are minimized. Tied metrics score 1 for all series. "
                                    "Use the table above for actual values and units.")
-                        st.plotly_chart(plot_metrics_radar(metrics_x, "Ux"), use_container_width=True)
+                        render_model_plot(plot_metrics_radar(metrics_x, "Ux"), use_container_width=True)
                     with y_tab:
                         y_ranges = comparison_axis_controls("Uy")
                         fig_y, metrics_y = plot_comparison(
                             chart_df, "Uy", "Peak |Uy|: actual vs. predicted", axis_ranges=y_ranges)
-                        st.plotly_chart(fig_y, use_container_width=True)
-                        st.dataframe(metrics_y, hide_index=True)
+                        render_model_plot(fig_y, use_container_width=True)
+                        render_model_table(metrics_y, hide_index=True)
                         st.subheader("Model performance spider plot — Uy")
                         st.caption("Relative scores (0–1) within the displayed model/fold selection; "
                                    "higher is better on every spoke. R² is maximized; MAPE, RMSE, "
                                    "and error SD are minimized. Tied metrics score 1 for all series. "
                                    "Use the table above for actual values and units.")
-                        st.plotly_chart(plot_metrics_radar(metrics_y, "Uy"), use_container_width=True)
+                        render_model_plot(plot_metrics_radar(metrics_y, "Uy"), use_container_width=True)
                     st.download_button("Download selected predictions (CSV)",
-                                       chart_df.to_csv(index=False).encode("utf-8"),
+                                       model_table_csv(chart_df),
                                        file_name="ssi_selected_predictions.csv", mime="text/csv")
             except Exception as exc:
                 st.error(f"Could not load or plot comparison database: {type(exc).__name__}: {exc}")
@@ -676,7 +778,7 @@ def overfit_ape_fold_histograms(errors, model, direction, folds,
                 marker={"color": colors[split]},
                 opacity=0.50, histnorm="percent" if normalized else "",
                 hovertemplate=(
-                    f"{model} / {fold} / {split}<br>"
+                    f"{display_model_name(model)} / {fold} / {split}<br>"
                     "APE bin: %{x:.3f}%<br>Height: %{y:.2f}<extra></extra>"
                 ),
             ), row=row, col=col)
@@ -729,7 +831,7 @@ def overfit_ape_fold_histograms(errors, model, direction, folds,
         paper_bgcolor="white", plot_bgcolor="white",
         font={"family": "Courier New, Courier, monospace",
               "size": 15, "color": "#000000"},
-        title={"text": f"{model} — |{direction}| APE distribution by fold",
+        title={"text": f"{display_model_name(model)} — |{direction}| APE distribution by fold",
                "x": 0.42, "font": {"size": 23, "color": "#000000"}},
         margin={"l": 100, "r": 45, "t": 100, "b": 75},
         showlegend=False,
@@ -856,7 +958,7 @@ def overfit_gain_plot(frame, direction, models, splits, baseline):
                 ys.append(i + shifts[split])
                 spread = float(means.std(ddof=1)) if len(means) > 1 else 0.0
                 sd.append(spread)
-                hover.append(f"{model}, {names[split]}<br>Gain: {xs[-1]:+.3f}"
+                hover.append(f"{display_model_name(model)}, {names[split]}<br>Gain: {xs[-1]:+.3f}"
                              f"<br>Fold SD: {spread:.3f}"
                              f"<br>Folds: {len(means)}")
             if xs:
@@ -890,7 +992,7 @@ def overfit_gain_plot(frame, direction, models, splits, baseline):
     fig.update_layout(
         template="plotly_white", width=1150, height=790,
         plot_bgcolor="white", paper_bgcolor="white",
-        title={"text": f"Peak |{direction}| — performance gain vs {baseline}",
+        title={"text": f"Peak |{direction}| — performance gain vs {display_model_text(baseline)}",
                "x": 0.5, "font": {"size": 19, "color": "#000000"}},
         font=font,
         legend={"orientation": "h", "x": 0.5, "xanchor": "center",
@@ -944,14 +1046,7 @@ def overfit_four_metric_fold_summary(data, direction):
 def overfit_four_metric_comparison(summary, direction, selected_models,
                                    selected_splits):
     """Publication-style RMSE/R2/MAPE/residual-SD panel comparison."""
-    display = {
-        "meshgraphnet": "MeshGraphNet",
-        "graph_transformer": "Graph Transformer",
-        "graph_operator": "Graph Operator",
-        "gnn_tcn": "GNN_TCN",
-        "tcn_lstm": "TCN_LSTM",
-        "mlp": "MLP", "gpr": "GPR",
-    }
+    display = MODEL_DISPLAY_NAMES
     order = [name for name in display if name in selected_models]
     order.extend(sorted(set(selected_models) - set(order)))
     four_metrics = [
@@ -1012,7 +1107,7 @@ def overfit_four_metric_comparison(summary, direction, selected_models,
             title_text=metric, row=subplot_row, col=subplot_col)
         fig.update_yaxes(
             tickmode="array", tickvals=list(range(len(order))),
-            ticktext=[display.get(model, model) for model in order],
+            ticktext=[display_model_name(model) for model in order],
             range=[len(order) - 0.35, -0.65],
             row=subplot_row, col=subplot_col)
     axis_style = {
@@ -1230,7 +1325,7 @@ with tab_range:
             selected_metrics = range_metrics[range_metrics["model"].isin(chosen)
                 & range_metrics["output"].isin(chosen_outputs)
                 & range_metrics["range"].astype(str).isin(chosen_ranges)]
-            st.dataframe(display_model_columns(selected_metrics), hide_index=True, use_container_width=True)
+            render_model_table(selected_metrics, hide_index=True, use_container_width=True)
             for output in chosen_outputs:
                 subset = selected_metrics[selected_metrics["output"] == output]
                 fig = go.Figure()
@@ -1247,9 +1342,10 @@ with tab_range:
                 fig.update_yaxes(showline=True, mirror=True, linecolor="#222222",
                                  linewidth=1.2, ticks="outside", gridcolor="#D0D0D0",
                                  griddash="dot")
-                st.plotly_chart(fig, use_container_width=True, key=f"v2_range_plot_{output}")
+                apply_reference_plot_style(fig)
+                render_model_plot(fig, use_container_width=True, key=f"v2_range_plot_{output}")
             st.download_button("Download selected range metrics CSV",
-                selected_metrics.to_csv(index=False).encode("utf-8"),
+                model_table_csv(selected_metrics),
                 file_name="range_ensemble_metrics_V2.csv", mime="text/csv")
 
 with tab_overfit:
@@ -1284,7 +1380,7 @@ with tab_overfit:
                 st.session_state["overfit_loaded"] = True
                 st.success(f"Loaded {len(of):,} predictions from {of.simulation_id.nunique():,} simulations.")
                 breakdown = of.groupby("split", sort=False).size().rename("Predictions").reset_index()
-                st.dataframe(breakdown, hide_index=True)
+                render_model_table(breakdown, hide_index=True)
                 if "train" not in set(of["split"]):
                     st.warning(
                         "This archive has no per-simulation training predictions. "
@@ -1370,7 +1466,7 @@ with tab_overfit:
                                             "x": 0.40,
                                             "font": {"size": 20},
                                         })
-                                    st.plotly_chart(
+                                    render_model_plot(
                                         plot, use_container_width=True,
                                         key=f"overfit_plot_{direction}_{model_name}")
                             st.markdown("### Per-simulation absolute percentage error histograms")
@@ -1405,7 +1501,7 @@ with tab_overfit:
                                                 normalized=(ape_hist_mode ==
                                                     "Percentage within each dataset"),
                                                 common_max=max_ape)
-                                            st.plotly_chart(
+                                            render_model_plot(
                                                 hist_figure, use_container_width=True,
                                                 key=f"overfit_ape_{direction}_{hist_model}")
                                 summary = ape_errors.groupby(
@@ -1417,11 +1513,11 @@ with tab_overfit:
                                     max_ape_pct=("APE (%)", "max"),
                                 )
                                 st.markdown("**Histogram statistics — threshold-adjusted MAPE (%)**")
-                                st.dataframe(display_model_columns(summary), hide_index=True,
+                                render_model_table(summary, hide_index=True,
                                              use_container_width=True)
                                 st.download_button(
                                     f"Download every {direction} simulation APE (CSV)",
-                                    ape_errors.to_csv(index=False).encode("utf-8"),
+                                    model_table_csv(ape_errors),
                                     file_name=f"ssi_overfitting_{direction}_individual_APE.csv",
                                     mime="text/csv",
                                     key=f"overfit_ape_download_{direction}")
@@ -1443,21 +1539,22 @@ with tab_overfit:
                                 four_figure = overfit_four_metric_comparison(
                                     four_summary, direction, chosen_models,
                                     selected_splits)
-                                st.plotly_chart(
+                                render_model_plot(
                                     four_figure, use_container_width=True,
                                     key=f"overfit_four_metrics_{direction}")
                                 st.download_button(
                                     f"Download {direction} four-panel summary (CSV)",
-                                    four_summary.to_csv(index=False).encode("utf-8"),
+                                    model_table_csv(four_summary),
                                     file_name=f"ssi_four_metrics_{direction}.csv",
                                     mime="text/csv",
                                     key=f"overfit_four_metrics_export_{direction}")
                             st.markdown("### Performance gain relative to a baseline")
                             baseline_choices = ["Training-mean predictor"] + [
-                                f"Model: {display_model_name(m)}" for m in sorted(of["model"].unique())
+                                f"Model: {m}" for m in sorted(of["model"].unique())
                             ]
                             gain_baseline = st.selectbox(
                                 "Baseline for gain analysis", baseline_choices,
+                                format_func=display_model_text,
                                 key=f"overfit_gain_baseline_{direction}")
                             st.caption(
                                 "Gain is computed on paired simulation IDs within each "
@@ -1473,7 +1570,7 @@ with tab_overfit:
                             if gain_rows.empty or not np.isfinite(gain_rows["gain"]).any():
                                 st.info("No valid matched baseline comparisons for the selection.")
                             else:
-                                st.plotly_chart(
+                                render_model_plot(
                                     overfit_gain_plot(
                                         gain_rows, direction, chosen_models,
                                         selected_splits, gain_baseline),
@@ -1481,18 +1578,18 @@ with tab_overfit:
                                     key=f"overfit_gain_plot_{direction}")
                                 st.download_button(
                                     f"Download {direction} fold-wise gain (CSV)",
-                                    gain_rows.to_csv(index=False).encode("utf-8"),
+                                    model_table_csv(gain_rows),
                                     file_name=f"ssi_gain_{direction}.csv",
                                     mime="text/csv",
                                     key=f"overfit_gain_download_{direction}")
                             st.markdown("**Metrics per model, fold, and dataset**")
                             per_fold = overfit_metrics_table(
                                 selected, direction, ["model", "fold", "split"])
-                            st.dataframe(display_model_columns(per_fold), hide_index=True)
+                            render_model_table(per_fold, hide_index=True)
                             st.markdown("**Pooled selected-fold metrics by model and dataset**")
                             pooled = overfit_metrics_table(
                                 selected, direction, ["model", "split"])
-                            st.dataframe(display_model_columns(pooled), hide_index=True)
+                            render_model_table(pooled, hide_index=True)
                             if not pooled.empty:
                                 radar_input = pooled.copy()
                                 radar_input["Series"] = (radar_input["model"] +
@@ -1502,7 +1599,7 @@ with tab_overfit:
                                            "validation: black/dashed; testing: red/solid. "
                                            "Model marker shapes remain distinct. "
                                            "Actual metrics are in the tables above.")
-                                st.plotly_chart(
+                                render_model_plot(
                                     plot_metrics_radar(radar_input, direction, distinguish_splits=True),
                                     use_container_width=True,
                                     key=f"overfit_radar_{direction}")
@@ -1522,15 +1619,15 @@ with tab_overfit:
                                     st.markdown("**Overfitting gap: held-out test versus training**")
                                     st.caption("Positive gap: R² decreased, or RMSE/Error SD "
                                                "increased on test relative to training.")
-                                st.dataframe(display_model_columns(gap.reset_index()), hide_index=True)
+                                render_model_table(gap.reset_index(), hide_index=True)
                             st.download_button(
                                 f"Download {direction} per-fold metrics CSV",
-                                per_fold.to_csv(index=False).encode("utf-8"),
+                                model_table_csv(per_fold),
                                 file_name=f"ssi_overfit_{direction}_metrics.csv",
                                 mime="text/csv", key=f"overfit_download_{direction}")
                     st.download_button(
                         "Download selected split-labeled predictions CSV",
-                        selected.to_csv(index=False).encode("utf-8"),
+                        model_table_csv(selected),
                         file_name="ssi_train_validation_test_selected.csv",
                         mime="text/csv", key="overfit_download_predictions")
             except Exception as exc:
@@ -1807,7 +1904,7 @@ with tab_case_study:
                         for col in ("actual_Ux_mm", "predicted_Ux_mm",
                                     "actual_Uy_mm", "predicted_Uy_mm"):
                             overview[col] = zero_small_displacements(overview[col])
-                        st.dataframe(display_model_columns(overview), hide_index=True)
+                        render_model_table(overview, hide_index=True)
                         ux_tab, uy_tab = st.tabs(["Case study Ux", "Case study Uy"])
                         for direction, panel in (("Ux", ux_tab), ("Uy", uy_tab)):
                             with panel:
@@ -1815,7 +1912,7 @@ with tab_case_study:
                                 limits = case_axis_controls(
                                     direction, "displacement", input_label,
                                     f"Peak |{direction}| displacement (mm)")
-                                st.plotly_chart(case_comparison_scatter(
+                                render_model_plot(case_comparison_scatter(
                                     chosen_data, feature, direction,
                                     "input_feature_" + stat, "displacement", limits),
                                     use_container_width=True,
@@ -1823,20 +1920,20 @@ with tab_case_study:
                                 limits = case_axis_controls(
                                     direction, "contribution", input_label,
                                     "Relative Shapley contribution (%)")
-                                st.plotly_chart(case_comparison_scatter(
+                                render_model_plot(case_comparison_scatter(
                                     chosen_data, feature, direction,
                                     "input_feature_" + stat, "shap", limits),
                                     use_container_width=True,
                                     key=f"shap_compare_phi_{direction}")
                                 st.caption("Feature importance uses mean absolute relative SHAP (%) "
                                            "across the selected cases and folds.")
-                                st.plotly_chart(
+                                render_model_plot(
                                     case_comparison_importance(chosen_data, direction),
                                     use_container_width=True,
                                     key=f"shap_compare_importance_{direction}")
                         st.download_button(
                             "Download selected SHAP cases with predictions",
-                            chosen_data.to_csv(index=False).encode("utf-8"),
+                            model_table_csv(chosen_data),
                             file_name="selected_shap_comparison.csv",
                             mime="text/csv", key="shap_compare_download")
             except Exception as exc:
@@ -2186,7 +2283,7 @@ with tab_new_prediction:
                             "Ux (mm)": 1000 * avg_ux, "Uy (mm)": 1000 * avg_uy,
                             "Fold SD Ux (mm)": np.nan, "Fold SD Uy (mm)": np.nan,
                         })
-                        st.dataframe(display_model_columns(pd.DataFrame(preview)), hide_index=True,
+                        render_model_table(pd.DataFrame(preview), hide_index=True,
                                      use_container_width=True)
                         st.caption("Each selected predictor type is shown with its own held-out estimate. "
                                    "For a five-fold ensemble, each model is averaged over its "
@@ -2343,7 +2440,7 @@ with tab_new_prediction:
                     progress_detail.success(
                         f"Parametric study finished: {successes}/{len(sweep_values)} "
                         "cases predicted and added to the cumulative plot.")
-                    st.dataframe(display_model_columns(pd.DataFrame(sweep_summary)),
+                    render_model_table(pd.DataFrame(sweep_summary),
                                  hide_index=True, use_container_width=True)
                     if successes < len(sweep_values):
                         st.warning(
@@ -2352,7 +2449,7 @@ with tab_new_prediction:
                     st.session_state["new_case_trend_input"] = sweep_key
 
             st.markdown("**Customized simulation inputs**")
-            st.dataframe(
+            render_model_table(
                 pd.DataFrame(
                     [{"Parameter": name, "Value": value}
                      for name, value in edited.items() if name != "Simulation_No"]
@@ -2387,7 +2484,7 @@ with tab_new_prediction:
         "points are not replaced.")
     history_table = new_prediction_history_rows(history)
     if not history_table.empty:
-        st.dataframe(display_model_columns(history_table), hide_index=True, use_container_width=True)
+        render_model_table(history_table, hide_index=True, use_container_width=True)
         feature_choices = [
             key for key in NEW_PREDICTION_FEATURES
             if key in history_table.columns
@@ -2444,7 +2541,7 @@ with tab_new_prediction:
                 "Predicted Ux vs input", "Predicted Uy vs input"])
             for direction, panel in (("Ux", ux_tab_new), ("Uy", uy_tab_new)):
                 with panel:
-                    st.plotly_chart(
+                    render_model_plot(
                         new_prediction_trend(
                             history_table, x_key, direction,
                             chosen_models, chosen_folds, chosen_runs, limits,
@@ -2453,7 +2550,7 @@ with tab_new_prediction:
                         key=f"new_case_trend_plot_{direction}")
         st.download_button(
             "Download all predicted cases (CSV)",
-            history_table.to_csv(index=False).encode("utf-8"),
+            model_table_csv(history_table),
             file_name="new_ssi_predictions.csv", mime="text/csv",
             key="new_case_history_csv")
         st.download_button(
@@ -2496,7 +2593,7 @@ with tab_new_prediction:
     f1.metric("Engineering/global parameters", "19")
     f2.metric("Graph feature channels", "15")
     f3.metric("Earthquake feature channels", "67")
-    st.dataframe(pd.DataFrame([
+    render_model_table(pd.DataFrame([
         {"Input category": "Structural geometry and layout",
          "Number": 7, "Includes": "Lengths, diameters, spans and pile geometry"},
         {"Input category": "Concrete and steel properties",
@@ -2551,7 +2648,7 @@ with tab_new_prediction:
                 )
                 rows.append({"Required input": name,
                              "Status": "Found" if valid_type else "Missing or wrong type"})
-            st.dataframe(pd.DataFrame(rows), hide_index=True)
+            render_model_table(pd.DataFrame(rows), hide_index=True)
             for name in ("EQs", "soil_profiles"):
                 folder = found.get(name)
                 if folder and folder.get("mimeType") == "application/vnd.google-apps.folder":
@@ -2676,7 +2773,7 @@ with tab_about:
         )
 
     st.subheader("How feature counts differ between model families")
-    st.table(pd.DataFrame([
+    render_model_static_table(pd.DataFrame([
         {"Representation": "Neural surrogate models",
          "Inputs": "19 global + 6 node + 9 edge + 47 record + 20 window channels",
          "Count": "101 feature channels"},
