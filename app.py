@@ -14,9 +14,47 @@ from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
 from inference_ensemble import available_models, predict_folds, prepare_model_bundle
 
+# Short labels used only in user-facing plots and headings.  Internal model
+# IDs remain unchanged so checkpoint lookup and CSV filtering are unaffected.
+MODEL_DISPLAY_NAMES = {
+    "mlp": "MLP",
+    "tcn_lstm": "TCN-LSTM",
+    "gnn_tcn": "GNN-TCN",
+    "meshgraphnet": "MG",
+    "graph_transformer": "GT",
+    "graph_operator": "GO",
+    "hybrid_mlp_meshgraphnet": "MLP-MG",
+    "hybrid_mlp_graph_transformer": "MLP-GT",
+    "hybrid_tcn_lstm_meshgraphnet": "TCN-LSTM-MG",
+    "hybrid_tcn_lstm_graph_transformer": "TCN-LSTM-GT",
+    "hybrid_gnn_tcn_graph_operator": "GNN-TCN-GO",
+    "gpr": "GPR",
+    "hybrid_mlp_gpr_predlevel": "MLP-GPR",
+    "hybrid_meshgraphnet_gpr_predlevel": "MG-GPR",
+    "hybrid_tcn_lstm_meshgraphnet_gpr_predlevel": "TCN-LSTM-MG-GPR",
+}
+
+
+def display_model_name(name):
+    """Return the concise label for a model while preserving unknown names."""
+    return MODEL_DISPLAY_NAMES.get(str(name), str(name))
+
+
+def display_series_name(series):
+    """Abbreviate the model portion of labels such as model / fold_1."""
+    text = str(series)
+    model, separator, suffix = text.partition(" / ")
+    return f"{display_model_name(model)}{separator}{suffix}" if separator else display_model_name(text)
+
+
 st.set_page_config(page_title="SSI Bridge ML Ensemble V2.0", layout="wide")
 st.title("SSI Bridge displacement prediction — Ensemble V2.0")
 st.caption("15 model choices using the new cluster training export. V1.0 remains unchanged.")
+with st.expander("Model abbreviation key", expanded=True):
+    st.table(pd.DataFrame(
+        [(full_name, short_name) for full_name, short_name in MODEL_DISPLAY_NAMES.items()],
+        columns=["Model", "Plot abbreviation"],
+    ))
 
 @st.cache_resource(show_spinner="Downloading and preparing the V2 model archive (first use only)...")
 def load_v2_model_archive(file_id, credentials_json):
@@ -172,11 +210,11 @@ def load_comparison_csv(file_id: str, credentials_json: str) -> pd.DataFrame:
     return df
 
 
-ZERO_THRESHOLD_MM = 1e-8
+ZERO_THRESHOLD_MM = 1e-3
 
 
 def zero_small_displacements(values):
-    """Treat absolute displacements below 1e-8 mm as exactly zero."""
+    """Treat absolute displacements below 0.001 mm as exactly zero."""
     values = np.asarray(values, dtype=float).copy()
     values[np.abs(values) < ZERO_THRESHOLD_MM] = 0.0
     return values
@@ -221,7 +259,7 @@ def plot_comparison(data: pd.DataFrame, direction: str, title: str, axis_ranges=
         if not len(actual):
             continue
         r2, mape, rmse, residual_std, mape_cases = metric_values(actual, predicted)
-        metrics.append({"Series": label, "Cases": len(actual), "MAPE valid cases": mape_cases,
+        metrics.append({"Series": display_series_name(label), "Cases": len(actual), "MAPE valid cases": mape_cases,
                         "R²": r2, "MAPE (%)": mape, "RMSE (mm)": rmse,
                         "Error SD (mm)": residual_std})
         model = str(subset["model"].iloc[0])
@@ -373,7 +411,7 @@ def plot_metrics_radar(metrics: pd.DataFrame, direction: str, distinguish_splits
             r=radial,
             theta=labels + [labels[0]],
             mode="lines+markers",
-            name=str(row["Series"]),
+        name=display_series_name(row["Series"]),
             line={"color": colors.get(model, "#555555"), "width": 2.2, "dash": style},
             marker={"symbol": symbols.get(model, "circle-open"), "size": 8,
                     "color": series_color},
@@ -405,7 +443,7 @@ with tab_compare:
     st.subheader("Actual vs. predicted peak displacements")
     st.caption("Held-out predictions from the new cluster run; changing selections does not retrain or rerun inference.")
     st.caption("Error SD (mm) is the sample standard deviation of actual minus predicted displacement errors (n − 1 denominator).")
-    st.caption("For plots and all metrics, values with |displacement| < 1e-8 mm are set to 0. "
+    st.caption("For plots and all metrics, values with |displacement| < 0.001 mm are set to 0. "
                "MAPE excludes cases where actual displacement is zero; 'MAPE valid cases' shows its denominator. "
                "The downloadable CSV retains original, unmodified values.")
     st.warning("These are held-out, out-of-fold predictions. The three GPR hybrids are cross-fitted from other folds; inspect the range metrics for performance across displacement decades.")
@@ -524,9 +562,9 @@ def overfit_metrics_table(data, direction, group_columns):
 
 
 def overfit_individual_ape(data, direction):
-    """Simulation-level APE using the app's 1e-8 mm zero-displacement rule.
+    """Simulation-level APE using the app's 0.001 mm zero-displacement rule.
 
-    Both actual and predicted values with magnitude below 1e-8 mm are zeroed.
+    Both actual and predicted values with magnitude below 0.001 mm are zeroed.
     Cases with adjusted zero actual displacement cannot have defined APE.
     """
     columns = ["simulation_id", "model", "fold", "split"]
@@ -806,7 +844,7 @@ def overfit_four_metric_fold_summary(data, direction):
 
     RMSE, R2, and residual SD: arithmetic mean +/- sample SD across folds.
     MAPE: lognormal median and asymmetric one-log-SD interval of fold MAPEs.
-    Both use the existing 1e-8 mm displacement threshold via metric_values.
+    Both use the existing 0.001 mm displacement threshold via metric_values.
     """
     fold_metrics = overfit_metrics_table(
         data, direction, ["model", "fold", "split"])
@@ -1008,7 +1046,7 @@ def overfit_fold_subplots(data, direction, fold_order, axis_ranges=None):
                 },
                 customdata=points.loc[valid, "simulation_id"].astype(str).to_numpy(),
                 hovertemplate=(
-                    f"Fold {fold}<br>{model} / {split}<br>"
+                    f"Fold {fold}<br>{display_model_name(model)} / {split}<br>"
                     "Case %{customdata}<br>Actual %{x:.4f} mm"
                     "<br>Predicted %{y:.4f} mm<extra></extra>"
                 ),
@@ -1151,7 +1189,7 @@ with tab_range:
                 for model_name, rows in subset.groupby("model", sort=True):
                     rows = rows.sort_values("range", key=lambda s: s.astype(str))
                     fig.add_trace(go.Scatter(x=rows["range"], y=rows[metric_name],
-                        mode="lines+markers", name=str(model_name)))
+                        mode="lines+markers", name=display_model_name(model_name)))
                 fig.update_layout(title=f"{output}: {metric_name} by actual displacement range",
                     xaxis_title="Actual displacement range (m)", yaxis_title=metric_name,
                     template="plotly_white", height=600, xaxis={"tickangle": -35})
@@ -1163,7 +1201,7 @@ with tab_range:
 with tab_overfit:
     st.subheader("Overfitting analysis — training, validation, and held-out test")
     st.caption("Training predictions are shown for the 12 checkpointed predictors when the cluster export includes them. The three GPR prediction-level hybrids are evaluated on held-out folds only.")
-    st.caption("All metrics and plot values use |U| < 1e-8 mm → 0 mm for both actual and "
+    st.caption("All metrics and plot values use |U| < 0.001 mm → 0 mm for both actual and "
                "predicted Ux/Uy. MAPE excludes adjusted zero actual values. "
                "Error SD is sample SD of prediction residuals.")
     st.warning("Validation data were used for model tuning/early stopping. "
@@ -1235,7 +1273,7 @@ with tab_overfit:
                             ["Number of simulations", "Percentage within each dataset"],
                             horizontal=True, key="overfit_ape_hist_mode")
                     st.caption(
-                        "These histograms use the same 1e-8 mm zero rule as "
+                        "These histograms use the same 0.001 mm zero rule as "
                         "the rest of this tab. Both actual and predicted "
                         "displacements below this magnitude are set to zero. "
                         "Cases with adjusted-zero actual displacement or "
@@ -1261,7 +1299,7 @@ with tab_overfit:
                                 if model_rows.empty:
                                     continue
                                 with st.expander(
-                                        f"{model_name} — {direction} | selected fold panels",
+                                        f"{display_model_name(model_name)} — {direction} | selected fold panels",
                                         expanded=True):
                                     st.caption(
                                         f"Showing {len(chosen_folds)} fold subplot(s) "
@@ -1272,7 +1310,7 @@ with tab_overfit:
                                         axis_ranges=custom_ranges)
                                     plot.update_layout(
                                         title={
-                                            "text": f"{model_name} — peak |{direction}| "
+                                            "text": f"{display_model_name(model_name)} — peak |{direction}| "
                                                     "by cross-validation fold",
                                             "x": 0.40,
                                             "font": {"size": 20},
@@ -1593,7 +1631,7 @@ def case_comparison_scatter(data, feature, direction, stat, kind, axis_ranges=No
             for title, column, marker in traces:
                 y = zero_small_displacements(rows[column].to_numpy(dtype=float))
                 fig.add_trace(go.Scatter(
-                    x=x, y=y, mode="markers", name=f"{model} / {fold} / {title}",
+                    x=x, y=y, mode="markers", name=f"{display_model_name(model)} / {fold} / {title}",
                     marker={"symbol": marker, "color": color, "size": fold_size,
                             "line": {"color": color, "width": 1.4}},
                     customdata=case_meta,
@@ -1605,7 +1643,7 @@ def case_comparison_scatter(data, feature, direction, stat, kind, axis_ranges=No
         else:
             y = rows["shapley_percent"].to_numpy(dtype=float)
             fig.add_trace(go.Scatter(
-                x=x, y=y, mode="markers", name=f"{model} / {fold}",
+                x=x, y=y, mode="markers", name=f"{display_model_name(model)} / {fold}",
                 marker={"symbol": shape + "-open", "color": color, "size": fold_size,
                         "line": {"color": color, "width": 1.4}},
                 customdata=case_meta,
@@ -1632,7 +1670,7 @@ def case_comparison_importance(data, direction):
     for model in sorted(df["model"].unique()):
         values = [float(summary.get((model, feature), 0)) for feature in ranking]
         fig.add_trace(go.Bar(
-            x=values, y=ranking, orientation="h", name=model,
+            x=values, y=ranking, orientation="h", name=display_model_name(model),
             marker_color=CASE_STUDY_COLORS.get(model, "#333333")))
     fig.update_layout(barmode="group", height=750)
     fig.update_yaxes(autorange="reversed")
@@ -1930,7 +1968,7 @@ def new_prediction_trend(data, feature, direction, model_filter, fold_filter,
             x=pd.to_numeric(part[feature], errors="coerce"),
             y=zero_small_displacements(
                 pd.to_numeric(part[f"{direction} (mm)"], errors="coerce")),
-            mode="markers", name=f"{model_name} / {fold}",
+            mode="markers", name=f"{display_model_name(model_name)} / {fold}",
             marker={
                 "symbol": fold_symbols.get(fold_number, "circle"),
                 "size": 8 + 2 * fold_number,
