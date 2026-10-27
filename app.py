@@ -2,6 +2,7 @@
 import json
 import io
 import re
+import base64
 from copy import deepcopy
 import pandas as pd
 import numpy as np
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import h5py
 import streamlit as st
+import streamlit.components.v1 as components
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
 from inference_ensemble import available_models, predict_folds, prepare_model_bundle
@@ -387,7 +389,283 @@ def render_model_plot(figure, **kwargs):
                 st.caption("Uses the shared plot-font settings at the top of the app, or the original style when those settings are off.")
     spec = apply_plot_label_spec(spec, labels)
     spec = apply_plot_font_spec(spec, fonts)
-    return st.plotly_chart(go.Figure(spec), **kwargs)
+    return render_downloadable_plot(go.Figure(spec), **kwargs)
+
+
+# One local component is shared by every plot. Plotly's installed JavaScript is
+# served by Streamlit, so this needs neither a CDN nor another Python package.
+# Figure data travels as component arguments, never as executable HTML.
+_PLOT_DOWNLOAD_HTML = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{margin:0;background:white;color:#222;font:13px Arial,sans-serif;overflow:hidden}
+#toolbar{display:flex;align-items:center;gap:10px;min-height:36px;flex-wrap:wrap}
+button{font:inherit;background:white;color:#222;border:1px solid #bbb;border-radius:4px;padding:6px 10px;cursor:pointer}
+button:hover,button:focus-visible{background:#eee;outline:2px solid #1565c0;outline-offset:1px}
+button:disabled{cursor:wait;opacity:.5}
+#hint{color:#555;font-size:12px} #status{color:#b00020;white-space:pre-wrap}
+#plot{width:100%} #menu{position:fixed;z-index:10000;padding:5px;background:white;border:1px solid #888;
+box-shadow:0 3px 12px #0003;border-radius:5px;max-width:calc(100vw - 20px)}
+#menu[hidden]{display:none} #menu button{display:block;width:100%;border:0;text-align:left;padding:9px}
+#menu small{display:block;max-width:280px;padding:6px;color:#555;line-height:1.4}
+</style></head><body>
+<div id="toolbar"><button id="download" disabled aria-haspopup="menu" aria-expanded="false">Download data ▾</button>
+<button id="expand" disabled>Expand plot</button><span id="hint">Right-click the plot to download its data.</span></div>
+<div id="status" role="status" aria-live="polite"></div>
+<div id="plot" tabindex="0" aria-label="Interactive plot; press Shift+F10 to download plotted data"></div>
+<div id="menu" role="menu" hidden>
+<button role="menuitem" data-export="plotted">Download plotted data (CSV)</button>
+<button role="menuitem" data-export="inputs">Download trace inputs (CSV)</button>
+<button role="menuitem" data-export="json">Download figure and data (JSON)</button>
+<small>Exports all points in visible series. Hidden legend series are excluded; zoom does not filter rows.
+Histogram CSVs contain rendered bins; trace inputs contain the original samples.</small>
+</div>
+<script src="plotly.min.js"></script><script>
+"use strict";
+const gd = document.getElementById("plot"), menu = document.getElementById("menu");
+const downloadButton = document.getElementById("download"), expandButton = document.getElementById("expand");
+const status = document.getElementById("status");
+let chartKey = "plot", plotHeight = 500, expanded = false, rendered = false, revision = 0;
+let renderQueue = Promise.resolve(), lastArgs = null;
+const clone = value => JSON.parse(JSON.stringify(value, (key, item) =>
+    ArrayBuffer.isView(item) ? Array.from(item) : item));
+const array = value => Array.isArray(value) || ArrayBuffer.isView(value);
+const at = (value, i) => array(value) ? value[i] : value;
+const title = object => typeof object?.title === "string" ? object.title : object?.title?.text || "";
+const axisKey = id => id[0] + "axis" + id.slice(1);
+const isVisible = trace => trace.visible !== false && trace.visible !== "legendonly";
+function send(type, data) { window.parent.postMessage({isStreamlitMessage:true, type, ...data}, "*"); }
+function setHeight() {
+    const height = expanded ? Math.max(plotHeight, 1000) : plotHeight;
+    gd.style.height = height + "px";
+    send("streamlit:setFrameHeight", {height: height + document.getElementById("toolbar").offsetHeight + status.offsetHeight + 8});
+}
+function baseRow(trace, index) {
+    const xaxis = trace.xaxis || "x", yaxis = trace.yaxis || "y";
+    return {chart:chartKey, plot_title:title(gd.layout), trace_index:index, series:trace.name || "",
+        trace_type:trace.type || "scatter", legend_group:trace.legendgroup || "",
+        xaxis, yaxis, x_label:title(gd.layout[axisKey(xaxis)]), y_label:title(gd.layout[axisKey(yaxis)]),
+        polar_subplot:trace.subplot || "", trace_meta:trace.meta ?? ""};
+}
+function tickLabel(id, value) {
+    const axis = gd.layout[axisKey(id)] || {}, values = axis.tickvals || [], labels = axis.ticktext || [];
+    const index = Array.from(values).findIndex(v => v === value);
+    return index >= 0 ? labels[index] : "";
+}
+function errorValues(error, value, i) {
+    if (!error || error.visible === false) return null;
+    const type = error.type || (error.array ? "data" : "percent");
+    let plus, minus;
+    if (type === "data") { plus = at(error.array, i); minus = error.symmetric === false ? at(error.arrayminus, i) : plus; }
+    else if (type === "constant") { plus = error.value ?? 0; minus = error.symmetric === false ? (error.valueminus ?? 0) : plus; }
+    else if (type === "percent") {
+        plus = Math.abs(value) * (error.value ?? 10) / 100;
+        minus = error.symmetric === false ? Math.abs(value) * (error.valueminus ?? 10) / 100 : plus;
+    } else if (type === "sqrt") { plus = minus = Math.sqrt(Math.abs(value)); }
+    return [plus, minus];
+}
+function traceRows(trace, index) {
+    const coordinateFields = ["x", "y", "r", "theta", "z", "labels", "values"];
+    const length = Math.max(0, ...coordinateFields.map(key => array(trace[key]) ? trace[key].length : 0));
+    const rows = [], base = baseRow(trace, index);
+    for (let i = 0; i < length; i++) {
+        const row = {...base, row_kind:trace.type === "histogram" ? "histogram_sample" : "point", point_index:i};
+        for (const key of coordinateFields) if (trace[key] !== undefined) row[key] = at(trace[key], i);
+        // Plotly's implicit coordinates for ordinary scatter/bar traces.
+        if (["scatter", "scattergl", "bar"].includes(trace.type || "scatter")) {
+            if (trace.x === undefined) row.x = (trace.x0 ?? 0) + i * (trace.dx ?? 1);
+            if (trace.y === undefined) row.y = (trace.y0 ?? 0) + i * (trace.dy ?? 1);
+        }
+        if (!coordinateFields.some(key => row[key] !== null && row[key] !== undefined)) continue;
+        row.x_tick_label = tickLabel(base.xaxis, row.x);
+        row.y_tick_label = tickLabel(base.yaxis, row.y);
+        for (const key of ["text", "hovertext", "hovertemplate", "customdata", "ids"])
+            if (trace[key] !== undefined) row[key] = at(trace[key], i);
+        for (const axis of ["x", "y"]) {
+            const errors = errorValues(trace["error_" + axis], row[axis], i);
+            if (errors) {
+                row[axis + "_error_plus"] = errors[0]; row[axis + "_error_minus"] = errors[1];
+                if (typeof row[axis] === "number") {
+                    row[axis + "_lower"] = Number.isFinite(errors[1]) ? row[axis] - errors[1] : null;
+                    row[axis + "_upper"] = Number.isFinite(errors[0]) ? row[axis] + errors[0] : null;
+                }
+            }
+        }
+        rows.push(row);
+    }
+    return rows;
+}
+function histogramRows(trace, index) {
+    // Read the same calculated bins Plotly draws, including normalization and
+    // empty interior bins. Do not re-bin in Python with different edge rules.
+    const calculated = gd.calcdata?.[index];
+    const full = gd._fullData?.[index] || trace;
+    const horizontal = full.orientation === "h", bins = full[horizontal ? "ybins" : "xbins"] || {};
+    const width = Number(bins.size), base = baseRow(trace, index), rows = [];
+    if (!Array.isArray(calculated)) throw new Error("Histogram bins are not ready. Wait for the plot and retry.");
+    for (const point of calculated) {
+        if (!Number.isFinite(point.p) || !Number.isFinite(point.s)) continue;
+        const row = {...base, row_kind:"histogram_bin", point_index:rows.length,
+            x:horizontal ? point.s : point.p, y:horizontal ? point.p : point.s,
+            bin_center:point.p, bin_height:point.s, histnorm:full.histnorm || "count",
+            histfunc:full.histfunc || "count", source_point_indices:point.pts || [],
+            sample_count:point.pts?.length ?? null, hovertemplate:trace.hovertemplate || ""};
+        if (Number.isFinite(width) && width > 0) {
+            row.bin_left = point.p - width / 2; row.bin_right = point.p + width / 2;
+        }
+        rows.push(row);
+    }
+    if (!rows.length && (trace.x?.length || trace.y?.length))
+        throw new Error("No rendered histogram bins are available. Use trace inputs or try again after rendering.");
+    return rows;
+}
+function exportRows(inputs = false) {
+    const rows = [];
+    (gd.data || []).forEach((trace, index) => {
+        if (!isVisible(trace)) return;
+        const part = !inputs && trace.type === "histogram" ? histogramRows(trace, index) : traceRows(trace, index);
+        for (const row of part) rows.push(row);
+    });
+    return rows;
+}
+function csvCell(value) {
+    if (value === undefined || value === null || (typeof value === "number" && !Number.isFinite(value))) return "";
+    let text = typeof value === "object" ? JSON.stringify(value) : String(value);
+    // Keep numerical precision; protect text cells when opened in spreadsheets.
+    if (typeof value === "string" && /^[\s]*[=+@-]/.test(text)) text = "'" + text;
+    return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+function rowsCSV(rows) {
+    const keys = [...new Set(rows.flatMap(row => Object.keys(row)))];
+    return "\ufeff" + [keys.map(csvCell).join(","), ...rows.map(row => keys.map(key => csvCell(row[key])).join(","))].join("\r\n");
+}
+function saveFile(contents, extension, mime, suffix) {
+    const name = chartKey.replace(/[^A-Za-z0-9_.-]+/g, "_") || "plot";
+    const url = URL.createObjectURL(new Blob([contents], {type:mime}));
+    const link = document.createElement("a"); link.href = url; link.download = name + "_" + suffix + "." + extension;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+function closeMenu() { menu.hidden = true; downloadButton.setAttribute("aria-expanded", "false"); }
+function openMenu(x, y) {
+    if (!rendered) return;
+    menu.hidden = false; downloadButton.setAttribute("aria-expanded", "true");
+    menu.style.left = Math.max(4, Math.min(x, window.innerWidth - menu.offsetWidth - 4)) + "px";
+    menu.style.top = Math.max(4, Math.min(y, window.innerHeight - menu.offsetHeight - 4)) + "px";
+    menu.querySelector("button").focus();
+}
+gd.addEventListener("contextmenu", event => { event.preventDefault(); openMenu(event.clientX, event.clientY); });
+gd.addEventListener("keydown", event => {
+    if ((event.shiftKey && event.key === "F10") || event.key === "ContextMenu") {
+        event.preventDefault(); const rect = gd.getBoundingClientRect(); openMenu(rect.left + 12, rect.top + 12);
+    }
+});
+downloadButton.addEventListener("click", () => {
+    if (!menu.hidden) { closeMenu(); return; }
+    const rect = downloadButton.getBoundingClientRect(); openMenu(rect.left, rect.bottom);
+});
+document.addEventListener("pointerdown", event => { if (!menu.contains(event.target) && event.target !== downloadButton) closeMenu(); });
+document.addEventListener("keydown", event => {
+    if (menu.hidden) return;
+    const items = [...menu.querySelectorAll("button")], index = items.indexOf(document.activeElement);
+    if (event.key === "Escape") { closeMenu(); downloadButton.focus(); }
+    else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault(); items[(index + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
+    }
+});
+window.addEventListener("blur", closeMenu);
+menu.addEventListener("click", event => {
+    const kind = event.target.closest("button")?.dataset.export; if (!kind) return;
+    closeMenu(); status.textContent = "";
+    try {
+        if (kind === "json") {
+            const data = gd.data.filter(isVisible);
+            const payload = {format:"ssi-plot-data-v1", chart:chartKey, exported_at:new Date().toISOString(),
+                scope:"All points in visible series; zoom does not filter rows",
+                figure:clone({data, layout:gd.layout}), plotted_data:exportRows()};
+            saveFile(JSON.stringify(payload, null, 2), "json", "application/json;charset=utf-8", "figure_data");
+        } else {
+            const rows = exportRows(kind === "inputs");
+            if (!rows.length) throw new Error("No visible data to download. Show a series using the legend first.");
+            saveFile(rowsCSV(rows), "csv", "text/csv;charset=utf-8", kind === "inputs" ? "trace_inputs" : "plotted_data");
+        }
+    } catch (error) { status.textContent = "Download failed: " + error.message; }
+    setHeight();
+});
+expandButton.addEventListener("click", () => {
+    expanded = !expanded; expandButton.textContent = expanded ? "Restore plot size" : "Expand plot";
+    setHeight(); Plotly.relayout(gd, {height:expanded ? Math.max(plotHeight, 1000) : plotHeight});
+});
+new ResizeObserver(() => { if (rendered && gd.clientWidth > 0) { setHeight(); Plotly.Plots.resize(gd); } }).observe(document.getElementById("toolbar"));
+window.addEventListener("message", event => {
+    if (event.source !== window.parent || event.data?.type !== "streamlit:render") return;
+    const args = event.data.args || {}, token = ++revision;
+    downloadButton.disabled = true; expandButton.disabled = true; rendered = false; closeMenu();
+    renderQueue = renderQueue.catch(() => {}).then(async () => {
+        if (token !== revision) return;
+        try {
+            if (!window.Plotly) throw new Error("Plot library did not load. Reload the app.");
+            const spec = clone(args.figure); chartKey = args.chart_key || "plot";
+            plotHeight = Number(spec.layout?.height) || 500;
+            spec.layout = spec.layout || {}; spec.layout.autosize = true;
+            if (args.use_container_width !== false) delete spec.layout.width;
+            spec.layout.height = expanded ? Math.max(plotHeight, 1000) : plotHeight;
+            setHeight();
+            // Avoid resetting user zoom/legend state on unrelated Streamlit reruns.
+            const signature = JSON.stringify(args);
+            if (signature !== lastArgs) {
+                await Plotly.react(gd, spec.data || [], spec.layout,
+                    {responsive:true, displaylogo:false, ...args.config});
+                lastArgs = signature;
+            }
+            if (token !== revision) return;
+            status.textContent = ""; rendered = true;
+            downloadButton.disabled = false; expandButton.disabled = false; setHeight();
+        } catch (error) { status.textContent = "Could not render plot: " + error.message; setHeight(); }
+    });
+});
+send("streamlit:componentReady", {apiVersion:1});
+send("streamlit:setFrameHeight", {height:540});
+</script></body></html>'''
+
+
+@st.cache_resource(show_spinner=False)
+def _plot_download_assets(component_html):
+    """Write shared component assets once, using the installed Plotly version."""
+    from plotly.offline import get_plotlyjs
+    directory = Path(tempfile.mkdtemp(prefix="ssi_plot_download_"))
+    (directory / "index.html").write_text(component_html, encoding="utf-8")
+    (directory / "plotly.min.js").write_text(get_plotlyjs(), encoding="utf-8")
+    return str(directory)
+
+
+def _plain_plot_arrays(value):
+    """Decode Plotly 6 binary arrays so CSV/JSON preserve numeric coordinates."""
+    if isinstance(value, dict):
+        if "bdata" in value and "dtype" in value:
+            values = np.frombuffer(base64.b64decode(value["bdata"]), dtype=np.dtype(value["dtype"]))
+            if value.get("shape"):
+                shape = value["shape"]
+                if isinstance(shape, str):
+                    shape = tuple(int(part.strip()) for part in shape.split(","))
+                values = values.reshape(shape)
+            return values.tolist()
+        return {key: _plain_plot_arrays(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return _plain_plot_arrays(value.tolist())
+    if isinstance(value, (list, tuple)):
+        return [_plain_plot_arrays(item) for item in value]
+    return value
+
+
+def render_downloadable_plot(figure, **kwargs):
+    """Render the same figure with local, browser-side data downloads."""
+    from plotly.utils import PlotlyJSONEncoder
+    spec = json.loads(json.dumps(_plain_plot_arrays(figure.to_plotly_json()), cls=PlotlyJSONEncoder))
+    component = components.declare_component("ssi_plot_download", path=_plot_download_assets(_PLOT_DOWNLOAD_HTML))
+    return component(figure=spec, chart_key=str(kwargs["key"]),
+                     use_container_width=kwargs.get("use_container_width", True),
+                     config=kwargs.get("config", {}), key=f"plot_download:{kwargs['key']}", default=None)
 
 
 def apply_reference_plot_style(fig):
