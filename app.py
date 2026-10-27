@@ -144,9 +144,250 @@ def abbreviate_plot_labels(figure):
     return go.Figure(abbreviate_plot_spec(figure.to_plotly_json()))
 
 
+PLOT_FONT_FAMILIES = {
+    "Courier New, Courier, monospace": "Courier New",
+    "Arial, sans-serif": "Arial",
+    "Times New Roman, Times, serif": "Times New Roman",
+    "Georgia, serif": "Georgia",
+    "Verdana, sans-serif": "Verdana",
+    "Tahoma, sans-serif": "Tahoma",
+    "Trebuchet MS, sans-serif": "Trebuchet MS",
+    "Helvetica, Arial, sans-serif": "Helvetica",
+    "Calibri, Arial, sans-serif": "Calibri",
+    "system-ui, sans-serif": "System font",
+}
+PLOT_FONT_ROLES = {
+    "base": ("General plot text", 14),
+    "title": ("Plot title", 20),
+    "x_title": ("X-axis titles", 17),
+    "y_title": ("Y-axis titles", 17),
+    "x_ticks": ("X-axis ticks / radar spokes", 14),
+    "y_ticks": ("Y-axis ticks / radar radial scale", 14),
+    "legend": ("Legend entries / fold legend boxes", 13),
+    "legend_title": ("Legend titles", 14),
+    "annotation": ("Subplot titles / annotations", 17),
+    "data_label": ("Data labels", 14),
+    "hover": ("Hover text", 13),
+    "colorbar_title": ("Color-scale titles", 17),
+    "colorbar_ticks": ("Color-scale tick labels", 14),
+}
+
+
+def default_plot_font_settings():
+    return {"family": next(iter(PLOT_FONT_FAMILIES)), "color": "#000000",
+            "sizes": {role: size for role, (_, size) in PLOT_FONT_ROLES.items()},
+            "families": {}, "colors": {}}
+
+
+def _font_for_role(settings, role):
+    return {"family": settings.get("families", {}).get(role) or settings["family"],
+            "size": settings["sizes"][role],
+            "color": settings.get("colors", {}).get(role) or settings["color"]}
+
+
+def _set_font(target, field, settings, role):
+    target.setdefault(field, {}).update(_font_for_role(settings, role))
+
+
+def _title_spec(target):
+    title = target.get("title")
+    if not isinstance(title, dict):
+        target["title"] = {"text": title} if isinstance(title, str) else {}
+    return target["title"]
+
+
+def apply_plot_font_spec(figure_spec, settings):
+    """Apply fonts after chart-specific styling, including all subplot axes."""
+    spec = deepcopy(figure_spec)
+    if settings is None:
+        return spec
+    layout = spec.setdefault("layout", {})
+    _set_font(layout, "font", settings, "base")
+    _set_font(_title_spec(layout), "font", settings, "title")
+    _set_font(layout.setdefault("hoverlabel", {}), "font", settings, "hover")
+
+    def colorbar_fonts(bar):
+        _set_font(bar, "tickfont", settings, "colorbar_ticks")
+        _set_font(_title_spec(bar), "font", settings, "colorbar_title")
+
+    for key, value in layout.items():
+        if re.fullmatch(r"[xy]axis\d*", key):
+            direction = key[0]
+            _set_font(value, "tickfont", settings, direction + "_ticks")
+            _set_font(_title_spec(value), "font", settings, direction + "_title")
+        elif re.fullmatch(r"legend\d*", key):
+            _set_font(value, "font", settings, "legend")
+            _set_font(_title_spec(value), "font", settings, "legend_title")
+        elif re.fullmatch(r"polar\d*", key):
+            _set_font(value.setdefault("angularaxis", {}), "tickfont", settings, "x_ticks")
+            _set_font(value.setdefault("radialaxis", {}), "tickfont", settings, "y_ticks")
+        elif re.fullmatch(r"coloraxis\d*", key):
+            colorbar_fonts(value.setdefault("colorbar", {}))
+    for annotation in layout.get("annotations", []):
+        is_legend = annotation.get("name") == "fold_dataset_legend"
+        role = "legend" if is_legend else "annotation"
+        _set_font(annotation, "font", settings, role)
+        if is_legend:
+            # Keep dataset marker colors while updating the legend's text color.
+            annotation["text"] = annotation.get("text", "").replace(
+                'style="color:#000000"',
+                f'style="color:{_font_for_role(settings, role)["color"]}"')
+    text_traces = {"scatter", "scattergl", "scatterpolar", "scatterpolargl",
+                   "bar", "pie", "sunburst", "treemap", "funnel", "funnelarea"}
+    for trace in spec.get("data", []):
+        if trace.get("type", "scatter") in text_traces or "textfont" in trace:
+            _set_font(trace, "textfont", settings, "data_label")
+        _set_font(trace.setdefault("hoverlabel", {}), "font", settings, "hover")
+        if "legendgrouptitle" in trace:
+            _set_font(trace["legendgrouptitle"], "font", settings, "legend_title")
+        for bar in (trace.get("colorbar"), trace.get("marker", {}).get("colorbar")):
+            if isinstance(bar, dict):
+                colorbar_fonts(bar)
+    return spec
+
+
+def apply_plot_label_spec(figure_spec, labels):
+    """Change display labels without altering numerical values or axis limits."""
+    spec = deepcopy(figure_spec)
+    if labels is None:
+        return spec
+    layout = spec.setdefault("layout", {})
+    if "title" in labels:
+        _title_spec(layout)["text"] = display_model_text(labels["title"])
+    for key, text in labels.get("axes", {}).items():
+        if key in layout and re.fullmatch(r"[xy]axis\d*", key):
+            _title_spec(layout[key])["text"] = display_model_text(text)
+    for key, text in labels.get("legends", {}).items():
+        if key in layout and re.fullmatch(r"legend\d*", key):
+            _title_spec(layout[key])["text"] = display_model_text(text)
+    spoke_labels = labels.get("spokes", {})
+    if spoke_labels:
+        for trace in spec.get("data", []):
+            if trace.get("type") in {"scatterpolar", "scatterpolargl"} and "theta" in trace:
+                trace["theta"] = [spoke_labels.get(str(value), value) for value in trace["theta"]]
+        for key, value in layout.items():
+            if re.fullmatch(r"polar\d*", key):
+                angular = value.get("angularaxis", {})
+                for field in ("categoryarray", "ticktext", "tickvals"):
+                    if field in angular:
+                        angular[field] = [spoke_labels.get(str(item), item) for item in angular[field]]
+    return spec
+
+
+def _initialize_plot_widget(key, value):
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def _reset_plot_fonts(scope):
+    for key in list(st.session_state):
+        if key.startswith(f"plot_font_widget:{scope}:"):
+            del st.session_state[key]
+    st.session_state.pop(f"plot_font_saved:{scope}", None)
+
+
+def plot_font_controls(scope, defaults=None):
+    """Stable widget keys keep settings separate for each chart and the defaults."""
+    saved_key = f"plot_font_saved:{scope}"
+    seed = st.session_state.get(saved_key, defaults or default_plot_font_settings())
+    prefix = f"plot_font_widget:{scope}:"
+    st.button("Reset fonts", key=f"plot_font_reset:{scope}",
+              on_click=_reset_plot_fonts, args=(scope,))
+    _initialize_plot_widget(prefix + "family", seed["family"])
+    _initialize_plot_widget(prefix + "color", seed["color"])
+    family = st.selectbox("Shared font family", list(PLOT_FONT_FAMILIES),
+                          format_func=PLOT_FONT_FAMILIES.get, key=prefix + "family")
+    color = st.color_picker("Shared text color", key=prefix + "color")
+    _initialize_plot_widget(prefix + "individual", bool(seed.get("families") or seed.get("colors")))
+    individual = st.checkbox("Choose a separate font family and color for each element",
+                             key=prefix + "individual")
+    result = {"family": family, "color": color, "sizes": {}, "families": {}, "colors": {}}
+    st.caption("Font sizes are in pixels. Radar spokes use X-tick settings; the radial scale uses Y-tick settings.")
+    for role, (label, default_size) in PLOT_FONT_ROLES.items():
+        cells = st.columns([3, 1.5, 2.5, 1.5] if individual else [3, 1.5])
+        cells[0].write(label)
+        _initialize_plot_widget(prefix + role + ":size", seed["sizes"].get(role, default_size))
+        result["sizes"][role] = int(cells[1].number_input(
+            f"{label} size (px)", min_value=6, max_value=96, step=1,
+            key=prefix + role + ":size", label_visibility="collapsed"))
+        if individual:
+            _initialize_plot_widget(prefix + role + ":family", seed.get("families", {}).get(role, ""))
+            result["families"][role] = cells[2].selectbox(
+                f"{label} font", [""] + list(PLOT_FONT_FAMILIES),
+                format_func=lambda font: PLOT_FONT_FAMILIES.get(font, "Use shared font"),
+                key=prefix + role + ":family", label_visibility="collapsed")
+            _initialize_plot_widget(prefix + role + ":color", seed.get("colors", {}).get(role) or color)
+            result["colors"][role] = cells[3].color_picker(
+                f"{label} color", key=prefix + role + ":color", label_visibility="collapsed")
+    st.session_state[saved_key] = deepcopy(result)
+    return result
+
+
+def plot_label_controls(scope, spec):
+    enabled_key = f"plot_labels_enabled:{scope}"
+    saved_enabled_key = f"plot_labels_enabled_saved:{scope}"
+    _initialize_plot_widget(enabled_key, st.session_state.get(saved_enabled_key, False))
+    enabled = st.checkbox("Customize titles and axis labels", key=enabled_key)
+    st.session_state[saved_enabled_key] = enabled
+    if not enabled:
+        return None
+    layout = spec.get("layout", {})
+    saved = st.session_state.get(f"plot_labels_saved:{scope}", {})
+    def text_input(label, identity, original):
+        key = f"plot_label_widget:{scope}:{identity}"
+        _initialize_plot_widget(key, saved.get(identity, original or ""))
+        value = st.text_input(label, key=key)
+        saved[identity] = value
+        return value
+    result = {"title": text_input("Plot title", "title", _title_spec(layout).get("text", "")),
+              "axes": {}, "legends": {}, "spokes": {}}
+    axis_keys = sorted((key for key in layout if re.fullmatch(r"[xy]axis\d*", key)),
+                       key=lambda key: (int(key[5:] or 1), key[0]))
+    for key in axis_keys:
+        number = int(key[5:] or 1)
+        result["axes"][key] = text_input(
+            f"{key[0].upper()}-axis label — panel {number}", key,
+            _title_spec(layout[key]).get("text", ""))
+    for key in layout:
+        if re.fullmatch(r"legend\d*", key):
+            result["legends"][key] = text_input(
+                f"Legend title {key[6:]}", key, _title_spec(layout[key]).get("text", ""))
+    spokes = list(dict.fromkeys(str(item) for trace in spec.get("data", [])
+                               if trace.get("type") in {"scatterpolar", "scatterpolargl"}
+                               for item in trace.get("theta", [])))
+    for spoke in spokes:
+        result["spokes"][spoke] = text_input(f"Radar label: {spoke}", f"spoke:{spoke}", spoke)
+    if spokes and (any(not label.strip() for label in result["spokes"].values())
+                   or len(set(result["spokes"].values())) != len(spokes)):
+        st.warning("Give each radar spoke a different, nonempty label. Original spoke labels are used until corrected.")
+        result["spokes"] = {}
+    st.caption("Leave a title or axis label empty to hide it. Include units in your custom labels.")
+    st.session_state[f"plot_labels_saved:{scope}"] = dict(saved)
+    return result
+
+
 def render_model_plot(figure, **kwargs):
-    """All tabs pass charts through this final label-formatting step."""
-    return st.plotly_chart(abbreviate_plot_labels(figure), **kwargs)
+    """Every chart receives the same font and label controls across all tabs."""
+    scope = kwargs["key"]
+    spec = abbreviate_plot_spec(figure.to_plotly_json())
+    fonts = st.session_state.get("plot_fonts_active")
+    with st.popover("Plot fonts and labels", use_container_width=True):
+        labels_tab, fonts_tab = st.tabs(["Titles and axis labels", "Fonts"])
+        with labels_tab:
+            labels = plot_label_controls(scope, deepcopy(spec))
+        with fonts_tab:
+            override_key = f"plot_fonts_override:{scope}"
+            saved_override_key = f"plot_fonts_override_saved:{scope}"
+            _initialize_plot_widget(override_key, st.session_state.get(saved_override_key, False))
+            override = st.checkbox("Use custom fonts for this plot", key=override_key)
+            st.session_state[saved_override_key] = override
+            if override:
+                fonts = plot_font_controls(scope, st.session_state.get("plot_font_saved:all"))
+            else:
+                st.caption("Uses the shared plot-font settings at the top of the app, or the original style when those settings are off.")
+    spec = apply_plot_label_spec(spec, labels)
+    spec = apply_plot_font_spec(spec, fonts)
+    return st.plotly_chart(go.Figure(spec), **kwargs)
 
 
 def apply_reference_plot_style(fig):
@@ -178,6 +419,12 @@ def apply_reference_plot_style(fig):
 st.set_page_config(page_title="SSI Bridge ML Ensemble V2.0", layout="wide")
 st.title("SSI Bridge displacement prediction — Ensemble V2.0")
 st.caption("15 model choices using the new cluster training export. V1.0 remains unchanged.")
+with st.expander("Plot font settings — all tabs", expanded=False):
+    st.caption("Set shared fonts here, or use 'Plot fonts and labels' above any chart for individual settings and editable axis labels.")
+    if st.checkbox("Apply shared font settings to all plots", key="plot_fonts_all_enabled"):
+        st.session_state["plot_fonts_active"] = plot_font_controls("all")
+    else:
+        st.session_state["plot_fonts_active"] = None
 with st.expander("Model abbreviation key", expanded=True):
     st.table(pd.DataFrame(
         [(full_name, short_name) for full_name, short_name in MODEL_DISPLAY_NAMES.items()],
@@ -631,26 +878,26 @@ with tab_compare:
                         x_ranges = comparison_axis_controls("Ux")
                         fig_x, metrics_x = plot_comparison(
                             chart_df, "Ux", "Peak |Ux|: actual vs. predicted", axis_ranges=x_ranges)
-                        render_model_plot(fig_x, use_container_width=True)
+                        render_model_plot(fig_x, use_container_width=True, key="comparison_scatter_Ux")
                         render_model_table(metrics_x, hide_index=True)
                         st.subheader("Model performance spider plot — Ux")
                         st.caption("Relative scores (0–1) within the displayed model/fold selection; "
                                    "higher is better on every spoke. R² is maximized; MAPE, RMSE, "
                                    "and error SD are minimized. Tied metrics score 1 for all series. "
                                    "Use the table above for actual values and units.")
-                        render_model_plot(plot_metrics_radar(metrics_x, "Ux"), use_container_width=True)
+                        render_model_plot(plot_metrics_radar(metrics_x, "Ux"), use_container_width=True, key="comparison_radar_Ux")
                     with y_tab:
                         y_ranges = comparison_axis_controls("Uy")
                         fig_y, metrics_y = plot_comparison(
                             chart_df, "Uy", "Peak |Uy|: actual vs. predicted", axis_ranges=y_ranges)
-                        render_model_plot(fig_y, use_container_width=True)
+                        render_model_plot(fig_y, use_container_width=True, key="comparison_scatter_Uy")
                         render_model_table(metrics_y, hide_index=True)
                         st.subheader("Model performance spider plot — Uy")
                         st.caption("Relative scores (0–1) within the displayed model/fold selection; "
                                    "higher is better on every spoke. R² is maximized; MAPE, RMSE, "
                                    "and error SD are minimized. Tied metrics score 1 for all series. "
                                    "Use the table above for actual values and units.")
-                        render_model_plot(plot_metrics_radar(metrics_y, "Uy"), use_container_width=True)
+                        render_model_plot(plot_metrics_radar(metrics_y, "Uy"), use_container_width=True, key="comparison_radar_Uy")
                     st.download_button("Download selected predictions (CSV)",
                                        model_table_csv(chart_df),
                                        file_name="ssi_selected_predictions.csv", mime="text/csv")
@@ -804,6 +1051,7 @@ def overfit_ape_fold_histograms(errors, model, direction, folds,
             key.append("No valid APE values")
         suffix = "" if index == 0 else str(index + 1)
         figure.add_annotation(
+            name="fold_dataset_legend",
             x=0.02, y=0.98,
             xref=f"x{suffix} domain", yref=f"y{suffix} domain",
             xanchor="left", yanchor="top",
@@ -1276,6 +1524,7 @@ def overfit_fold_subplots(data, direction, fold_order, axis_ranges=None):
             '<span style="color:#000000">Ideal (1:1)</span>')
         suffix = "" if panel == 0 else str(panel + 1)
         fig.add_annotation(
+            name="fold_dataset_legend",
             x=0.02, y=0.98,
             xref=f"x{suffix} domain", yref=f"y{suffix} domain",
             xanchor="left", yanchor="top",
